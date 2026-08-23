@@ -1,43 +1,77 @@
 # trayplay
 
-Systray Jellyfin music player. The tray icon is the home; clicking it opens a popup
-that is the entire UI. Playback is controllable over MPRIS (`playerctl`, media keys).
+A systray-focused Jellyfin music player for Linux.
 
-Scope: Jellyfin only, random play, go-to-artist, go-to-album, next/prev/play-pause.
-No in-app volume control - the system mixer owns volume.
+Features:
+- Jellyfin only, read-only: browse artists → albums → tracks, play, queue.
+- Random play that refills itself, or an album, or one artist's catalogue.
+- Queue that survives a restart, with add-to-queue and play-next from any row.
+- Repeat off / whole queue / one track, mirrored on MPRIS `LoopStatus`.
+- Gapless transitions, seeking, and a local track cache.
+- Works on X11 (native XEmbed tray) and Wayland (SNI, `gtk4-layer-shell`).
+- Themable through CSS with a documented, stable set of selectors (see
+  [THEMING.md](THEMING.md)).
 
-Status: **milestone 5**. Tray, popup UI (now playing + artist/album browsing),
-theming, Jellyfin read path, audio playback, and MPRIS.
+Not in scope:
+- Volume control (the system mixer owns volume)
+- Playlists
+- Library management
+- Any backend other than Jellyfin
 
-The popup opens on the now-playing view: cover art as a blurred backdrop, title,
-artist and album (both clickable to navigate there), seek bar, transport with
-**shuffle** at its right end, and a bottom row of **Settings**, **Library** and
-**Queue**. Library goes artists → albums → tracks.
+## Requirements
 
-Activating a track plays it and shuffles the rest of its page's scope behind it:
-on an album page that is the album, on an artist page it is everything by that
-artist. Each page's **Play** button plays that page's tracks in listing order
-instead.
+- A Jellyfin server, and an account on it, duh.
+- GTK4 and libadwaita. On NixOS the flake handles this; elsewhere you need the
+  GTK4, libadwaita, `gtk4-layer-shell` and ALSA development packages.
+- For the popup to be *placed* on X11, a window manager rule — see
+  [Running under X11](#running-under-x11).
+- Optional: a compositor with blur, if you want the translucent look to blur what
+  is behind it.
 
-There is no search page: every list page filters as you type, so the library
-covers it. The gap that leaves is finding an album or track whose artist you
-cannot remember - only the artist list is loaded, so the filter cannot see
-further than that.
+## Install
 
-**Queue** lists what the player is holding, with the current track marked.
-Activating a row plays from that point.
+```sh
+nix build && ./result/bin/trayplay
+```
 
-Tracks with no cover art collapse the reserved art space rather than showing an
-empty gap, so a sparsely tagged library still looks deliberate.
+Or run it straight from the flake:
 
-Hiding the popup — auto-hide, Escape, the tray icon — resets it to now-playing, so
-it always opens where you left it conceptually rather than halfway down a
-discography.
+```sh
+nix run 'git+https://git@git.gurkan.in/gurkan/trayplay.git'
+```
 
-## Keyboard
+## Login
 
-On the now-playing view only. Pushed pages type into their filter bar instead, and
-Escape closes the popup anywhere.
+```sh
+trayplay login --server https://${SERVER_URL} --username ${USERNAME}
+trayplay dump-random --limit 20  # verifies auth and queries without the UI
+```
+
+`--server`/`--username` fall back to `config.toml` when omitted.
+
+The access token lives in `$XDG_CONFIG_HOME/trayplay/credentials.toml`, mode `0600`
+in a `0700` directory; trayplay refuses to read it if the mode is looser than that.
+`device_id` beside it is a generated UUID identifying this install in Jellyfin's
+session list, deleting it just creates a new session entry.
+
+## Hints
+
+There is no separate search page, every list page filters as you type. On the
+Library page that filter goes to the server and searches artists, albums *and*
+tracks, so you can find a record without remembering who made it.
+
+**Queue** shows what the player is holding, with the current track marked; it
+updates live and is restored when trayplay starts again. Activating a row plays
+from that point. You can add whatever you want to the queue; either at the end or
+as next-to-play.
+
+Tracks with no cover art get a generated panel instead of an empty space: a colour
+derived from the album name, with that name tiled across it on an angle, drifting
+slowly. To reduce motion, see [Settings](#settings-page).
+
+### Keyboard
+
+Main window:
 
 | Key | Action |
 |---|---|
@@ -50,66 +84,37 @@ Escape closes the popup anywhere.
 | `s` | Settings |
 | `a` | The current track's album |
 | `A` | Focus the first artist |
+| `Ctrl`+`Q` | Quit |
 
-`A` focuses rather than navigating because a track can credit several artists and
-picking one is the point. While an artist is focused the arrows move between
-artists instead of seeking, and `Enter` opens the focused one. That state ends on
-`Enter`, on `Escape`, on any other shortcut, or by itself after five seconds — so
-the arrows go back to seeking without needing to be told.
+`A` focuses rather than navigating, because a track can credit several artists and
+picking one is the point. While an artist is focused the arrows move between artists
+instead of seeking, and `Enter` opens the focused one.
 
-Anything with Ctrl or Alt is left to the window and the desktop.
+Anything with Ctrl or Alt is left to the window and the desktop, apart from Ctrl+Q.
 
 On list pages (library, artist, album, queue):
 
 | Key | Action |
 |---|---|
-| `↑` / `↓` | Move between rows, **across sections** — Albums into Other tracks and back |
+| `↑` / `↓` | Move between rows, **across sections**, Albums into Other tracks and back |
 | `→` | Activate the focused row, same as `Enter` |
 | `←` | Back |
-| `Shift`+`Enter` | The row's first menu entry: **Add to queue** on a library page, **Remove from queue** on the queue |
-| any character | Opens the filter bar and types into it; the arrows then move the caret |
+| `Shift`+`Enter` | The row's first menu entry: **Add to queue**, or **Remove from queue** on the queue page |
+| any text | Opens the filter bar and types into it; the arrows then move the caret |
 
-Right-clicking a row opens that menu, which is where the shortcut is discoverable. On
-library pages (artists, albums, tracks, search hits) it offers **Add to queue** and
-**Play next** — append to the end, or slot in directly after the current track. Either
-way nothing starts playing, and a random queue keeps refilling behind the additions.
-An artist row queues that artist's whole catalogue, an album row the album.
-
-On the queue page it offers **Remove from queue**. The track playing right now cannot
-be removed, and neither can one already handed to the audio thread for a gapless
-transition (only ever the following track, in its last few seconds) — both say so with
-a toast rather than doing nothing.
-
-## Tray interactions
+### Tray
 
 | Input | Action | X11 (XEmbed) | Wayland/KDE (SNI) |
 |---|---|---|---|
 | Left click | Show, raise, or hide the popup (see below) | yes | yes |
 | Middle click | Play/pause | yes | yes |
-| Scroll up / down | Next / previous track | yes (vendored fix - see below) | yes |
-| Right click | Context menu | no menu at all - see below | yes (SNI `ContextMenu`, not rebindable) |
+| Scroll up / down | Next / previous track | yes | yes |
+| Right click | Context menu | no menu | yes (SNI `ContextMenu`) |
 
-Left click is not a plain visible/hidden toggle. Hidden → shown; on screen **with** focus →
-hidden; on screen **without** focus (behind another window, or on a tag you switched back
-to) → raised and focused, because closing it there would just throw away what you wanted to
-look at. The exception is a blur less than 1.2s old, which still counts as focused: under
-focus-follows-mouse the popup is unfocused the moment the pointer reaches the tray, and
-without that grace the click could never close it again.
+Quit is **Ctrl+Q** on the popup window everywhere rather than a tray menu item:
+X11's tray icon has no menu to put one on.
 
-Quit is **Ctrl+Q** on the popup window everywhere, not a tray menu item - X11's tray icon
-has no menu to put one on (`tray::TrayIconEvent` has no concept of one, and its `tray-menu`
-companion needs GTK3 alongside this GTK4 app to draw one; not worth linking two GTK
-versions into one process for six menu items). See "Tray: two backends, one per display"
-in `CLAUDE.md` for why X11 and Wayland/KDE behave differently here.
-
-The scroll direction under SNI depends on the host: `delta`'s sign is not fixed by the
-spec. Swap the arms in `sni::Tray::scroll` (`src/tray/sni.rs`) if it steps the wrong way.
-X11 scroll goes through a locally vendored, patched copy of the `tray` crate
-(`vendor/tray/`, see `PATCH.md` there) - upstream misreports scroll-wheel notches as left
-clicks, which made scrolling toggle the popup open/shut instead of doing anything with the
-scroll itself.
-
-## MPRIS
+### MPRIS
 
 Registers as `org.mpris.MediaPlayer2.trayplay`:
 
@@ -121,74 +126,11 @@ playerctl -p trayplay loop Track|Playlist|None
 ```
 
 Transport, metadata and `LoopStatus`. `Volume` is absent — the system mixer owns
-volume — and so is `Shuffle`: random play here is a way of *building* a queue, not a
-switch on an existing one, so there is nothing for the property to toggle.
-`LoopStatus` is the same setting as the repeat button (`Playlist` = repeat the queue,
-`Track` = repeat this track), so changing it either way updates the other, and it
-survives a restart. `Raise` shows the popup, `Quit` exits.
-
-## Login
-
-```sh
-trayplay login --server https://jellyfin.example.org --username gurkan
-trayplay dump-random --limit 20   # verifies auth and queries without the UI
-trayplay logout
-```
-
-`--server`/`--username` fall back to `config.toml` when omitted. The password is read
-from the terminal without echo and never stored.
-
-## Build
-
-```sh
-nix develop          # devShell with the pinned toolchain, GTK4, playerctl
-cargo run
-```
-
-or
-
-```sh
-nix build && ./result/bin/trayplay
-```
-
-Note: `Cargo.toml` version requirements were written without crates.io access. Run
-`cargo update` on a networked host to generate `Cargo.lock` against current releases
-before the first build.
-
-### Bundled fonts
-
-Drop `.ttf`/`.otf`/`.ttc` files into `data/fonts/` and they are compiled in on the next
-build — the family name is read out of the font itself, so there is no list to update.
-They are used by the no-art panel, which picks one per album. Empty is fine and is the
-default. Everything bundled there is **SIL OFL 1.1**, with each font's notice shipped
-beside it — see `data/fonts/README.md`, which also covers why the files are written to
-`$XDG_DATA_HOME/fonts/trayplay/` at startup.
-
-## Running under AwesomeWM (X11)
-
-One extra piece is needed on X11: the tray icon itself docks natively (no bridge process
-required, see `CLAUDE.md`), but popup placement still needs a WM rule.
-
-### Popup placement
-
-GTK4 removed window positioning API on X11, so the WM places the popup. trayplay
-sets a stable `WM_CLASS` of `trayplay`:
-
-```lua
--- rc.lua
-ruled.client.append_rule {
-  rule = { class = "trayplay" },
-  properties = {
-    floating     = true,
-    ontop        = true,
-    skip_taskbar = true,
-    placement    = awful.placement.top_right + awful.placement.no_offscreen,
-  },
-}
-```
-
-Under Wayland (somewm) this isn't needed: the tray is native SNI and the popup uses
-`gtk4-layer-shell`, anchored per the `anchor` config key.
+volume, and so is `Shuffle`: random play here is a way of *building* a queue rather
+than a switch on an existing one, so there would be nothing to toggle. `LoopStatus`
+is the same setting as the repeat button (`Playlist` = repeat the queue, `Track` =
+repeat this track), so changing either updates the other. `Raise` shows the popup,
+`Quit` exits.
 
 ## Configuration
 
@@ -196,188 +138,132 @@ Under Wayland (somewm) this isn't needed: the tray is native SNI and the popup u
 
 ```toml
 server             = "https://jellyfin.example.org"
-username           = "gurkan"
+username           = "you"
 anchor             = "top-right"   # top-left|top-right|bottom-left|bottom-right
 margin             = 8
 width              = 380
 height             = 520
 hide_on_focus_loss = false         # initial value only; the settings page owns it
+hide_delay_ms      = 0             # wait this long after losing focus before hiding
+x11_window_type    = "utility"     # X11 only; this is the default
 random_batch       = 100
-cache_max_mb       = 2048
+cache_max_mb       = 500           # initial value only; the settings page owns it
 prefetch_next      = true
 ```
 
-`anchor` and `margin` only take effect under Wayland/layer-shell. On X11 the WM rule
-above decides placement.
+`anchor` and `margin` only take effect under Wayland/layer-shell. On X11 the window
+manager decides placement — see below.
 
-The Jellyfin access token is never stored here. It lives in
-`$XDG_CONFIG_HOME/trayplay/credentials.toml`, mode `0600` in a `0700` directory.
-trayplay refuses to read it if the mode is looser than that. A secret-service
-backend can be slotted in behind the `TokenStore` trait later.
+`x11_window_type` sets `_NET_WM_WINDOW_TYPE` on the popup — the EWMH name without its
+`_NET_WM_WINDOW_TYPE_` prefix. It defaults to **`utility`**, which is what this window is
+by EWMH's own definition (a persistent auxiliary window, not a document window), and it
+keeps window manager and compositor rules written for ordinary windows from applying to
+it. GTK4 removed `set_type_hint` with no replacement, so trayplay sets the property itself,
+before the window is first mapped. Set `"normal"` for GTK's own behaviour.
 
-`device_id` next to it is a generated UUID identifying this install to Jellyfin's
-session list. Deleting it just creates a new server-side session entry.
+`hide_delay_ms` is a trade rather than an improvement, which is why it defaults to 0
+(hide on the next main-loop turn). A delay swallows focus that bounces straight back,
+but whatever the window manager and compositor do with a window that is about to
+disappear — restacking it, fading it, re-redirecting the screen around a fullscreen
+window — then happens in plain sight for that long. If the popup looks like it flashes
+or jumps as it hides, that is the compositor, not the delay: with picom, try
+`unredir-if-possible = false` or `fade-exclude = [ "class_g = 'trayplay'" ]`.
 
 ### Settings page
 
 What the popup's own settings page changes is written to
-`$XDG_STATE_HOME/trayplay/settings.toml`, not to `config.toml` - a hand-edited
-file should not be rewritten by a switch.
+`$XDG_STATE_HOME/trayplay/settings.toml`, never to `config.toml`: a hand-edited file
+should not be rewritten by a switch.
 
 ```toml
-color_scheme       = "dark"   # light|dark; absent means follow the desktop
-hide_on_focus_loss = false    # absent means take config.toml's value
+color_scheme       = "dark"    # light|dark; absent means follow the desktop
+reduce_motion      = false
+hide_on_focus_loss = false     # absent means take config.toml's value
+cache_max_mb       = 500       # absent means take config.toml's value
+repeat             = "off"     # off|all|one
 ```
 
-**Dark mode** starts out matching the desktop's preference. Flipping it forces the
-choice from then on, so a night-light schedule cannot flip the popup back. Delete
-the key to follow the desktop again.
+**Dark mode** starts out matching the desktop. Flipping it forces the choice from
+then on, so a night-light schedule cannot flip the popup back. Delete the key to
+follow the desktop again if you don't know what you want.
+
+**Reduce motion** holds the no-art panel still. The panel is still drawn, this is
+about movement.
 
 **Auto-hide when unfocused** closes the popup as soon as it loses focus. Off by
 default, because under focus-follows-mouse it would close every time the pointer
-crossed the window. It applies immediately, no restart. When the key is absent
-`config.toml`'s `hide_on_focus_loss` is used, so an existing setting there still
-means something; once the switch is touched, this file wins.
+crossed the window.
 
-## Track cache
+**Cache limit** caps `$XDG_CACHE_HOME/trayplay/`, in megabytes, and the row shows how
+much is in use. Lowering it prunes immediately rather than waiting for the next
+download; entries go oldest-download-first. 500 MB by default.
 
-Tracks are downloaded to `$XDG_CACHE_HOME/trayplay/` before being decoded, not
-streamed straight into the decoder. Decoders probe by seeking - an MP3 reader wants
-the ID3v1 tag in the last 128 bytes, and an MP4/M4A `moov` atom may sit at the end
-of the file - and rodio reports the stream length as unknown, so a seek past the
-download head fails. rodio 0.20 also converts a seek error during initialisation
-into a panic.
+## Running under X11
 
-The cost is a short wait before the first track; the next one is prefetched while
-the current plays, so transitions stay gapless. `cache_max_mb` bounds the directory,
-pruned least-recently-used.
+The tray icon docks natively — no bridge process — but GTK4 removed window
+positioning on X11, so the window manager places the popup. trayplay sets a stable
+`WM_CLASS` of `trayplay` to match on. For AwesomeWM:
 
-## Codecs
-
-flac, mp3, m4a/aac, alac and wav are decoded locally. Everything else - Opus, WMA,
-APE, DSD - is transcoded by the server, because playback goes through
-`/Audio/<id>/universal` with a container whitelist rather than
-`/stream?static=true`.
-
-Decoding uses a symphonia-backed `rodio::Source` of our own
-(`src/player/decoder.rs`) rather than `rodio::Decoder`, which forces gapless
-handling that breaks on transcoded mp3, panics on seek errors, and hides the stream
-length so transcoded tracks cannot be seeked.
-
-Ogg is deliberately not on the direct-play list: it usually carries Opus, which
-symphonia cannot decode, and a container name cannot tell Opus from Vorbis. That
-costs a re-encode on Vorbis files and makes Opus play at all.
-
-## Theming
-
-CSS only. `data/default.css` is compiled into the binary and loaded at
-`APPLICATION` priority; your `$XDG_CONFIG_HOME/trayplay/theme.css` is loaded at
-`USER` priority, so you only need to state what you want to change. The file is
-watched and reapplied without restarting.
-
-Selectors are a stability contract - renames are treated as breaking changes.
-
-| Selector | Widget |
-|---|---|
-| `#trayplay-popup` | the popup window. Also carries `light` or `dark`, whichever palette is in force — GTK CSS has no prefers-color-scheme query, and the two want different scrim strengths |
-| `#trayplay-nav` | navigation stack inside the window |
-| `.trayplay-body` | content box on every page |
-| `#trayplay-art` | cover art backdrop. Custom widget — **do not apply `filter: blur()`**, it draws its own sharp-to-blurred gradient (radius and fade band are in `src/ui/artwork.rs`). The no-art panel is drawn here too and is **not themable**: its colours come from a hash of the album name, and its angle, tiling, slide and zoom from constants in the same file |
-| `#trayplay-art-space` | space reserved at the top for the art; sized only under `.has-art` |
-| `#trayplay-scrim` | gradient that fades the art out behind the text |
-| `.has-art` | set on the now-playing root whenever a track is showing — real cover art *or* the generated no-art panel. Only "nothing playing" leaves it off and collapses the space |
-| `#trayplay-tags` | box holding title, artists and album. Its `opacity` is animated on a track change — **do not set opacity here**, it will be overwritten |
-| `#trayplay-title` | track title |
-| `#trayplay-artists` | strip holding one button per credited artist; scrolls by wheel or drag and fades its own edges — **do not give it a background**, the fade is a mask over what it draws |
-| `.trayplay-artist` | one artist button inside that strip (navigates to that artist). A class, not an id: there can be several |
-| `#trayplay-album` | album button (navigates to the album) |
-| `#trayplay-seek` | seek slider. Style the parts through its GTK nodes: `trough` (track), `trough highlight` (played portion), `slider` (handle — sized to nothing at rest, a translucent block on `:hover`/`:active`) |
-| `#trayplay-seek.seeking` | set while a seek is issued but not yet in effect; pulses `trough highlight` |
-| `#trayplay-seek value` | elapsed time, drawn above the handle. Always present so its height never shifts the layout; `#trayplay-seek.showing-value` is what makes it visible, on hover. There are no permanent elapsed/total labels — `#trayplay-position` and `#trayplay-duration` are gone |
-| `#trayplay-transport` | centre box holding the transport buttons, with repeat at its left end and shuffle at its right |
-| `.trayplay-glyph` | transport controls, drawn as bare glyphs — the rule that strips the button shape in every state. Adwaita's `.flat` is not enough, it still paints a hover background |
-| `#trayplay-prev` / `#trayplay-play` / `#trayplay-next` | transport buttons. Glyph *sizes* are not themable: `GLYPH_SIZE` / `PLAY_GLYPH_SIZE` in `src/ui/nowplaying.rs` are set with `set_pixel_size`, which CSS cannot override |
-| `#trayplay-random` | shuffle, at the right of the transport row |
-| `#trayplay-repeat` | repeat, at the left of the transport row. `#trayplay-repeat.repeat-active` is set while repeat is on (either kind), since the three glyphs are close at this size |
-| `#trayplay-actions` | bottom action row |
-| `#trayplay-settings` | settings button, bottom left, square |
-| `#trayplay-library` | library button |
-| `#trayplay-queue` | queue button |
-| `#trayplay-settings-page` | settings page body |
-| `#trayplay-dark-switch` / `#trayplay-motion-switch` / `#trayplay-autohide-switch` | its three switches |
-| `#trayplay-list` | list box on artist/album/track pages |
-| `#trayplay-section` | section heading ("Albums", "Other tracks") |
-| `#trayplay-filter` / `#trayplay-filter-entry` | type-to-filter bar on list pages |
-| `.trayplay-row` | a row in those lists |
-| `#trayplay-page-action` | header button on a list page ("Play") |
-| `#trayplay-status` | signed-out text |
-| `#trayplay-toast` | toast overlay wrapping the navigation stack; the banner itself is libadwaita's `.toast` node inside it |
-| `#trayplay-row-menu` | a row's right-click menu; its entries are `button` nodes inside it |
-
-`#trayplay-error` was removed: a failed library query is a toast now, not a page of its
-own, so there is no error label left to style. Restyle `#trayplay-toast .toast` instead.
-
-Debugging: `GTK_DEBUG=interactive cargo run` opens the GTK inspector, which shows the
-live CSS node tree. Use it when a container stays opaque — it names the exact node.
-
-### Transparency and blur
-
-The baseline theme is translucent: `alpha(@window_bg_color, 0.55)` on
-`#trayplay-popup`, with the nested containers that paint their own background
-cleared so the tint applies once.
-
-There is no CSS property for blur-behind. GTK only makes the window translucent;
-the compositor blurs what shows through. On X11 that means picom with
-`blur-background = true` and a compositing backend (`glx` or `egl`). Under Wayland
-transparency works but blur depends on the compositor supporting it.
-
-Everything that follows from being translucent is in `default.css` too: text
-carries `text-shadow` and glyphs a `drop-shadow` instead of being dimmed, and list
-rows and the action buttons keep a faint `@card_bg_color` fill so they do not
-vanish into it.
-
-`#trayplay-scrim` is what makes the lower half read as dark (or light) rather than
-as album art: it ramps `@window_bg_color` from transparent at the top to `0.88`
-near the bottom, stopping short of opaque so the compositor still has something to
-blur. Raising the ceiling hides more of the art, lowering it lets a bright cover
-haze the text.
-
-Light mode uses about two thirds of that (`0.6`), and a thinner window tint. The
-same alpha of white is far heavier than of a dark colour — it flattens the art
-into a sheet, where dark reads as depth. Those overrides hang off
-`#trayplay-popup.light`, and the text shadows flip from dark haloes to light ones
-under it.
-
-Tune `alpha(@window_bg_color, 0.55)` for the transparency/legibility trade-off.
-With no compositor running, or to go back to a solid window:
-
-```css
-/* ~/.config/trayplay/theme.css */
-#trayplay-popup {
-  background-color: @window_bg_color;
+```lua
+-- rc.lua
+ruled.client.append_rule {
+  rule = { class = "trayplay" },
+  properties = {
+    floating     = true,
+    skip_taskbar = true,
+    -- Worth having if you run a compositor: a bordered, custom-shaped window
+    -- with a shadow made picom flicker the popup on every focus change. None of
+    -- the three does anything useful for a window that has no titlebar anyway.
+    border_width = 0,
+    shape        = gears.shape.rectangle,
+    shadow       = false,
+    placement    = awful.placement.top_right + awful.placement.no_offscreen,
+  },
 }
 ```
 
-**Do not give the transport buttons a background here.** `theme.css` is `USER`
-priority and outranks everything in `default.css`, so a
-`#trayplay-transport button { background-color: ... }` rule puts the button shape
-back behind glyphs that are drawn without one - and no rule in the built-in theme
-can win against it.
+Under Wayland none of this is needed: the tray is native SNI and the popup is a
+`gtk4-layer-shell` surface anchored per the `anchor` config key.
 
-## Logging
+## Theming
 
-`RUST_LOG=trayplay=debug cargo run`
+CSS only, with a stable set of selectors and hot reload from
+`$XDG_CONFIG_HOME/trayplay/theme.css`. See **[THEMING.md](THEMING.md)** for the
+selector contract, the transparency/blur setup, and the handful of properties that
+must be left alone because they are animated in code.
 
-## Icons
+## How playback works
 
-Transport and action icons come from [ionicons](https://github.com/ionic-team/ionicons)
-and [Phosphor](https://github.com/phosphor-icons/core), both MIT. The files live in
-`data/icons/scalable/actions/`, renamed to `trayplay-*-symbolic` so they neither
-shadow icon theme names nor lose GTK's symbolic recolouring. Each set keeps its
-own `LICENSE` and a `SOURCES.md` mapping every file back to its upstream name,
-under `data/icons/ionicons/` and `data/icons/phosphor/`.
+Tracks are downloaded to `$XDG_CACHE_HOME/trayplay/` before being decoded rather
+than streamed straight into the decoder: decoders probe by seeking, and a seek past
+the download head fails. The cost is a short wait before the first track; the next
+one is prefetched while the current plays, so transitions stay gapless.
+The cache is bounded by the limit in Settings (500 MB by default) and pruned
+oldest-download-first, both at startup and after every completed download.
 
-`build.rs` compiles them into a GResource bundle with `glib-compile-resources`,
-which `src/icons.rs` registers on the display's icon theme at startup. To add
-one: drop the file in, add a line to `data/icons/trayplay.gresource.xml`, and
-refer to it by name.
+flac, mp3, m4a/aac, alac and wav are decoded locally. Everything else (Opus, WMA,
+APE, DSD, whatever) is transcoded by the server, because playback goes through
+`/Audio/<id>/universal` with a container whitelist rather than `/stream?static=true`.
+Ogg is deliberately not on the direct-play list: it usually carries Opus, which the
+decoder cannot handle, and a container name cannot tell Opus from Vorbis.
+
+## Icons and fonts
+
+Transport and action icons come from [ionicons](https://github.com/ionic-team/ionicons),
+[Phosphor](https://github.com/phosphor-icons/core) and
+[Qlementine](https://github.com/oclero/qlementine-icons) — all MIT — plus one MynaUI
+icon. They live in `data/icons/scalable/actions/`, renamed to `trayplay-*-symbolic`
+so they neither shadow icon theme names nor lose GTK's symbolic recolouring; each set
+keeps its own `LICENSE` and a `SOURCES.md` mapping every file to its upstream name.
+`build.rs` compiles them into a GResource bundle. To add one: drop the file in, add a
+line to `data/icons/trayplay.gresource.xml`, and refer to it by name.
+
+Fonts are a drop-in directory: put `.ttf`/`.otf`/`.ttc` files in `data/fonts/` and
+they are compiled in on the next build, with the family name read out of the font
+itself. They are used by the no-art panel, one per album. Empty is fine and is the
+default; everything already bundled there uses SIL OFL 1.1. See `data/fonts/README.md`.
+
+## Licence
+
+Anything declared above as MIT is MIT, fonts are SIL OFL 1.1, and everything else is
+WTFPL, see [LICENSE](LICENSE).

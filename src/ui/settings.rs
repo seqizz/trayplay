@@ -10,7 +10,22 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::config::{ColorScheme, Settings};
+use crate::config::{self, ColorScheme, Settings};
+use crate::player::{cache::Cache, Command};
+
+use super::Session;
+
+/// How much of the cache is in use, for the limit row's subtitle.
+///
+/// Measured on the GTK thread rather than the runtime: it is one directory
+/// listing and a `stat` per entry, and the page is being built anyway.
+fn cache_subtitle() -> String {
+    let Ok(dir) = config::cache_dir() else {
+        return "Downloaded tracks, pruned oldest-first".to_string();
+    };
+    let megabytes = Cache::size_of(&dir) / (1024 * 1024);
+    format!("{megabytes} MB in use; oldest downloads are pruned first")
+}
 
 /// Applies a stored choice, or hands control back to the desktop when there is
 /// none.
@@ -57,8 +72,13 @@ fn apply_scheme_class(window: &adw::ApplicationWindow, dark: bool) {
 pub fn page(
     hide_on_blur: Rc<Cell<bool>>,
     on_reduce_motion: Rc<dyn Fn(bool)>,
+    session: &Session,
+    config_limit_mb: u64,
 ) -> adw::NavigationPage {
     let manager = adw::StyleManager::default();
+    // Same fallback as the popup's auto-hide: the stored value wins, config.toml
+    // answers until the row is touched.
+    let limit = Settings::load().cache_max_mb.unwrap_or(config_limit_mb);
 
     let dark = adw::SwitchRow::builder()
         .title("Dark mode")
@@ -129,6 +149,31 @@ pub fn page(
 
     let behaviour = adw::PreferencesGroup::builder().title("Behaviour").build();
     behaviour.add(&hide);
+
+    // Megabytes, in steps of 100: the point of this control is "roughly how much
+    // disk may this take", not a byte-exact figure.
+    let cache = adw::SpinRow::with_range(100.0, 20_000.0, 100.0);
+    cache.set_title("Cache limit (MB)");
+    cache.set_subtitle(&cache_subtitle());
+    cache.set_value(limit as f64);
+    cache.set_widget_name("trayplay-cache-row");
+
+    let player = session.player.clone();
+    cache.connect_value_notify(move |row| {
+        let megabytes = row.value().max(0.0) as u64;
+        // Straight to the player, which owns the cache and prunes with it, so
+        // lowering the limit takes effect now rather than at the next download.
+        player.send(Command::SetCacheLimit(megabytes * 1024 * 1024));
+        if let Err(err) = Settings::update(|settings| settings.cache_max_mb = Some(megabytes)) {
+            tracing::warn!(%err, "cannot persist the cache limit");
+        }
+        // Pruning happens on the player thread, so the figure below is what was
+        // on disk a moment ago rather than the result. Close enough to tell
+        // whether the cache is anywhere near its ceiling, which is the question
+        // this answers.
+        row.set_subtitle(&cache_subtitle());
+    });
+    behaviour.add(&cache);
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)

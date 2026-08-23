@@ -11,6 +11,9 @@ const TICKS_PER_SECOND: i64 = 10_000_000;
 pub struct AuthResponse {
     pub user: UserDto,
     pub access_token: String,
+    /// Read by nothing yet; kept because it names the server a token belongs to,
+    /// which is what would distinguish two of them.
+    #[allow(dead_code)]
     #[serde(default)]
     pub server_id: String,
 }
@@ -27,6 +30,9 @@ pub struct UserDto {
 pub struct ItemsResponse {
     #[serde(default)]
     pub items: Vec<Item>,
+    /// Only meaningful when a query asks for it - trayplay's paged queries pass
+    /// `enableTotalRecordCount=false` precisely to avoid the server counting.
+    #[allow(dead_code)]
     #[serde(default)]
     pub total_record_count: i64,
 }

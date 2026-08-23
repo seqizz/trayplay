@@ -122,6 +122,16 @@ impl TrayIconImpl {
             &[0, XEMBED_MAPPED],
         )?;
 
+        // PATCH (trayplay): StructureNotify on the *root* window, which is how a
+        // client hears the MANAGER announcement when a system tray appears (or
+        // reappears) - ICCCM says the manager broadcasts it there. Per-client
+        // event masks, so this does not disturb the window manager's own
+        // selection. Without it there is no way to notice a tray restarting.
+        conn.change_window_attributes(
+            screen.root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )?;
+
         let tray_owner = conn.get_selection_owner(atoms._NET_SYSTEM_TRAY_S0)?.reply()?.owner;
 
         if tray_owner != x11rb::NONE {
@@ -141,6 +151,7 @@ impl TrayIconImpl {
             });
         }
 
+        let root = screen.root;
         let running = Arc::new(AtomicBool::new(true));
         let event_thread = {
             let conn = Arc::clone(&conn);
@@ -148,7 +159,9 @@ impl TrayIconImpl {
             let id = id.clone();
             let icon_data = Arc::clone(&icon_data);
             thread::spawn(move || {
-                Self::event_loop(conn, screen_num, window, gc, depth, id, running, icon_data);
+                Self::event_loop(
+                    conn, screen_num, window, root, atoms, gc, depth, id, running, icon_data,
+                );
             })
         };
 
@@ -180,17 +193,53 @@ impl TrayIconImpl {
         Ok(())
     }
 
+    /// Asks the current tray, if any, to embed the icon window again.
+    ///
+    /// PATCH (trayplay): the owner is re-read every time rather than cached from
+    /// construction - a tray that restarted has a different owner window, and a
+    /// dock request sent to the old one goes nowhere.
+    fn try_dock(conn: &RustConnection, window: Window, atoms: &TrayAtoms) -> bool {
+        let Ok(cookie) = conn.get_selection_owner(atoms._NET_SYSTEM_TRAY_S0) else {
+            return false;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return false;
+        };
+        if reply.owner == x11rb::NONE {
+            return false;
+        }
+        // Re-asserted because a tray reads it when it takes the window, and this
+        // is the flag that tells it to map what it embeds.
+        let _ = conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            atoms._XEMBED_INFO,
+            atoms._XEMBED_INFO,
+            &[0, XEMBED_MAPPED],
+        );
+        let docked = Self::send_dock_request(conn, reply.owner, window, atoms).is_ok();
+        let _ = conn.flush();
+        docked
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn event_loop(
         conn: Arc<RustConnection>,
         screen_num: usize,
         window: Window,
+        root: Window,
+        atoms: TrayAtoms,
         gc: Gcontext,
         depth: u8,
         id: TrayIconId,
         running: Arc<AtomicBool>,
         icon_data: Arc<Mutex<Option<IconData>>>,
     ) {
+        // PATCH (trayplay): set while the icon is not embedded in anything, so
+        // the dock request is retried until a tray takes it. See PATCH.md.
+        let mut undocked = false;
+        let mut idle_ticks: u32 = 0;
+
         while running.load(Ordering::Relaxed) {
             match conn.poll_for_event() {
                 Ok(Some(event)) => {
@@ -201,6 +250,39 @@ impl TrayIconImpl {
                         x11rb::protocol::Event::ConfigureNotify(e) if e.window == window => {
                             Self::draw_icon(&conn, screen_num, window, gc, depth, &icon_data);
                         }
+                        // PATCH (trayplay): the icon was handed back to the root
+                        // window - which is what AwesomeWM does to every embedded
+                        // icon when it rebuilds its bars after a monitor is
+                        // plugged in or the systray moves screen. Left alone, a
+                        // mapped InputOutput window sitting on the root is just an
+                        // ordinary client, so the window manager decorates it and
+                        // the "tray icon" becomes a stray window. Unmapping hides
+                        // it immediately; the retry below gets it back into the
+                        // tray once one exists again.
+                        x11rb::protocol::Event::ReparentNotify(e)
+                            if e.window == window && e.parent == root =>
+                        {
+                            let _ = conn.unmap_window(window);
+                            let _ = conn.flush();
+                            undocked = true;
+                            idle_ticks = 0;
+                            Self::try_dock(&conn, window, &atoms);
+                        }
+                        // Embedded again (by a tray, not by the root).
+                        x11rb::protocol::Event::ReparentNotify(e) if e.window == window => {
+                            undocked = false;
+                        }
+                        // PATCH (trayplay): a tray announcing itself. Sent when
+                        // one starts for the first time *and* when one restarts,
+                        // which is the other way this icon can end up homeless.
+                        x11rb::protocol::Event::ClientMessage(e)
+                            if e.type_ == atoms.MANAGER
+                                && e.data.as_data32()[1] == atoms._NET_SYSTEM_TRAY_S0 =>
+                        {
+                            undocked = true;
+                            idle_ticks = 0;
+                            Self::try_dock(&conn, window, &atoms);
+                        }
                         _ => {}
                     }
                     if let Some(tray_event) = Self::handle_event(&event, window, &id) {
@@ -209,6 +291,18 @@ impl TrayIconImpl {
                 }
                 Ok(None) => {
                     thread::sleep(std::time::Duration::from_millis(16));
+                    // PATCH (trayplay): retry about once a second while homeless.
+                    // A single request at the moment of eviction is not enough:
+                    // the bar being rebuilt has usually not created its systray
+                    // widget yet, so the request lands nowhere and no further
+                    // event ever arrives to prompt another attempt.
+                    if undocked {
+                        idle_ticks += 1;
+                        if idle_ticks >= 62 {
+                            idle_ticks = 0;
+                            Self::try_dock(&conn, window, &atoms);
+                        }
+                    }
                 }
                 Err(_) => break,
             }

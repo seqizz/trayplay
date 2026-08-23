@@ -253,6 +253,10 @@ impl Client {
         Ok(resp.items)
     }
 
+    /// One item by id. Nothing calls it today - every page fetches lists - but
+    /// it is the natural way to re-resolve a remembered id, which is what a
+    /// persisted queue holds.
+    #[allow(dead_code)]
     pub async fn item(&self, item_id: &str) -> Result<Item> {
         self.get_json(&format!("/Users/{}/Items/{item_id}", self.user_id()?), &[])
             .await

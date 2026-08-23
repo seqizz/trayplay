@@ -24,6 +24,14 @@ const TICK: Duration = Duration::from_millis(250);
 /// Refill a random queue once this few tracks remain.
 const REFILL_SLACK: usize = 5;
 
+/// How many missing tracks in a row `start_current` will skip past before giving
+/// up and stopping.
+///
+/// A bound rather than "until something plays": with repeat-all and a queue whose
+/// files have all moved, skipping would walk the same circle forever. Sixteen is
+/// well past a few stale ids and well short of anything a user would sit through.
+const MAX_MISSING_SKIPS: usize = 16;
+
 /// How close to the end of the current track the next one is handed to the sink.
 ///
 /// Late on purpose. rodio has no API for dropping a source already queued behind
@@ -47,9 +55,13 @@ pub enum State {
 pub enum Command {
     /// Start a fresh random queue.
     PlayRandom,
-    /// Play an album from its first track.
+    /// Play an album from its first track. Unused by the UI, which sends
+    /// `PlayItems` with a list it already has, but this is the id-only entry
+    /// point anything outside the popup would want.
+    #[allow(dead_code)]
     PlayAlbum(String),
-    /// Play everything by an artist, album by album.
+    /// Play everything by an artist, album by album. Unused for the same reason.
+    #[allow(dead_code)]
     PlayArtist(String),
     /// Play an explicit list, starting at an index. Used by the album track list
     /// so picking a track plays the rest of the album after it.
@@ -65,6 +77,9 @@ pub enum Command {
     QueueLast { items: Vec<Item> },
     /// Insert directly after the track playing now.
     QueueNext { items: Vec<Item> },
+    /// New track-cache ceiling, in bytes. Applied and pruned at once, so the
+    /// settings page does not have to wait for the next download to see it.
+    SetCacheLimit(u64),
     /// Step the repeat setting on: off → all → one → off. What the button does.
     CycleRepeat,
     /// Set it outright. What MPRIS `LoopStatus` does.
@@ -108,6 +123,12 @@ pub struct Snapshot {
     pub repeat: Repeat,
 }
 
+/// `TrackChanged` carries a whole `Item` and so dwarfs every other variant, which
+/// clippy objects to. Left alone deliberately: the broadcast ring is 64 slots, so
+/// the "waste" is about 20 KB once, while boxing would add an allocation per track
+/// change and force six match sites to dereference - and it would not make the
+/// per-subscriber clone any cheaper, since that deep-copies the `Item` either way.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Event {
     TrackChanged(Option<Item>),
@@ -302,6 +323,15 @@ impl Player {
 
                 self.queue.replace(items, 0, Mode::Explicit);
                 self.start_current().await?;
+            }
+            Command::SetCacheLimit(bytes) => {
+                self.cache.set_max_bytes(bytes);
+                // Pruning is blocking filesystem work, but it is a directory
+                // listing and a few unlinks, and it only happens when someone
+                // moves the slider.
+                if let Err(err) = self.cache.prune() {
+                    tracing::warn!(%err, "cache prune failed");
+                }
             }
             Command::CycleRepeat => self.set_repeat(self.repeat.next()),
             Command::SetRepeat(repeat) => self.set_repeat(repeat),
@@ -651,28 +681,102 @@ impl Player {
         }
     }
 
+    /// Starts whatever the cursor points at, skipping past tracks the server has
+    /// lost.
+    ///
+    /// A loop rather than recursion into itself: an async fn calling itself needs
+    /// boxing, and more importantly the bound is the thing that makes this safe.
+    /// Repeat-all on a queue whose tracks have all gone would otherwise walk in a
+    /// circle forever, dropping and re-trying.
     async fn start_current(&mut self) -> Result<()> {
-        let Some(item) = self.queue.current().cloned() else {
-            self.set_state(State::Stopped);
+        for _ in 0..MAX_MISSING_SKIPS {
+            let Some(item) = self.queue.current().cloned() else {
+                self.set_state(State::Stopped);
+                return Ok(());
+            };
+
+            let reader = match self.open(&item).await {
+                Ok(reader) => reader,
+                // A track the server cannot serve *at all* is dropped from the
+                // queue and skipped, rather than reported and left in place to
+                // fail again every time it comes round. Anything else - a network
+                // blip, a transcode that fell over - is reported and left alone,
+                // because it may well work next time.
+                Err(err) if err.downcast_ref::<cache::Gone>().is_some() => {
+                    if self.drop_missing(&item) {
+                        continue;
+                    }
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
+            self.sink.play(reader).context("starting playback")?;
+
+            // play() discards anything previously queued behind it.
+            self.queued_next = None;
+            self.warming = None;
+            // Whatever was restored has now been played from, so Play is back to
+            // meaning "resume" rather than "resume the previous session".
+            self.resume_pending = false;
+            self.emit(Event::TrackChanged(Some(item)));
+            self.set_state(State::Playing);
+            // Every queue change worth remembering ends up here: a new queue, a
+            // skip, a Previous, a track row. The sink's own gapless advance is the
+            // one exception, persisted from the tick loop.
+            self.persist();
             return Ok(());
-        };
+        }
 
-        let reader = self.open(&item).await?;
-        self.sink.play(reader).context("starting playback")?;
-
-        // play() discards anything previously queued behind it.
-        self.queued_next = None;
-        self.warming = None;
-        // Whatever was restored has now been played from, so Play is back to
-        // meaning "resume" rather than "resume the previous session".
-        self.resume_pending = false;
-        self.emit(Event::TrackChanged(Some(item)));
-        self.set_state(State::Playing);
-        // Every queue change worth remembering ends up here: a new queue, a
-        // skip, a Previous, a track row. The sink's own gapless advance is the
-        // one exception, persisted from the tick loop.
-        self.persist();
+        self.sink.stop();
+        self.set_state(State::Stopped);
+        self.emit(Event::Failed(
+            "too many tracks in a row are missing on the server".into(),
+        ));
         Ok(())
+    }
+
+    /// Drops every copy of a track the server has no file for and steps to
+    /// whatever follows it. Returns false when nothing does.
+    ///
+    /// Mostly a restored-queue problem: Jellyfin derives item ids from paths, so
+    /// reorganising a library gives every moved file a new id while the old one
+    /// still resolves to a path that is gone. A queue remembered from before the
+    /// move is then full of ids the server will 404 forever - and the queue is
+    /// exactly the thing this player restores on startup.
+    fn drop_missing(&mut self, item: &Item) -> bool {
+        tracing::warn!(id = %item.id, name = %item.name, "dropping a track the server no longer has");
+        self.emit(Event::Failed(format!(
+            "{} is no longer on the server, skipping it",
+            item.name
+        )));
+
+        // Every copy, not just the one at the cursor: a queue can hold the same
+        // track twice and both are equally dead. Reverse order so the indices
+        // ahead of each removal stay valid, and `remove` keeps the cursor on its
+        // own track as the list shifts under it.
+        let cursor = self.queue.cursor();
+        for index in (0..self.queue.items().len()).rev() {
+            if index != cursor && self.queue.items()[index].id == item.id {
+                self.queue.remove(index);
+            }
+        }
+
+        // The one at the cursor last, since `remove` deliberately refuses it.
+        let mut stepped = self.queue.remove_current();
+        // It was the final track, but repeat-all means the queue does not end.
+        if !stepped && self.repeat == Repeat::All && !self.queue.is_empty() {
+            stepped = self.queue.advance(true).is_some();
+        }
+
+        self.persist();
+        self.emit(Event::QueueChanged);
+
+        if !stepped {
+            self.sink.stop();
+            self.set_state(State::Stopped);
+            self.emit(Event::TrackChanged(None));
+        }
+        stepped
     }
 
     /// Reader for starting playback: may still be downloading if the format

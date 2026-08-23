@@ -91,7 +91,7 @@ impl SymphoniaSource {
             codec_params.sample_rate.unwrap_or(44_100),
             codec_params
                 .channels
-                .unwrap_or_else(|| symphonia::core::audio::Channels::FRONT_LEFT),
+                .unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT),
         );
 
         let mut source = Self {

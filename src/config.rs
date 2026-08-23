@@ -9,19 +9,15 @@ use serde::{Deserialize, Serialize};
 /// The tray icon's own coordinates are deliberately ignored: StatusNotifierItem
 /// does not report them, so anchoring to a monitor corner is the only approach
 /// that behaves identically on X11 and Wayland.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Anchor {
     TopLeft,
+    /// Where a tray usually is, so it is the default.
+    #[default]
     TopRight,
     BottomLeft,
     BottomRight,
-}
-
-impl Default for Anchor {
-    fn default() -> Self {
-        Self::TopRight
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -40,6 +36,29 @@ pub struct Config {
     /// where focus follows mouse would make the popup unusable.
     pub hide_on_focus_loss: bool,
 
+    /// How long auto-hide waits after the blur, in milliseconds.
+    ///
+    /// Zero means the next main-loop turn, which is as immediate as GTK allows
+    /// and the right answer on most setups. A delay only helps where the window
+    /// manager or compositor is still moving things around when the blur
+    /// arrives; it costs visibility, because whatever the compositor does with a
+    /// window that is about to disappear happens in plain sight for that long.
+    pub hide_delay_ms: u64,
+
+    /// `_NET_WM_WINDOW_TYPE` for the popup on X11, without the
+    /// `_NET_WM_WINDOW_TYPE_` prefix: "utility", "dialog", "dock", "normal".
+    ///
+    /// Defaults to **utility**, which is what this window actually is by EWMH's
+    /// definition - a persistent auxiliary window, not a document window - and
+    /// what keeps window manager and compositor rules written for ordinary
+    /// windows from applying to it. That is not cosmetic: with AwesomeWM and
+    /// picom, being an ordinary `normal` window made the popup flicker every time
+    /// it lost focus. Set "normal" to get GTK's own behaviour back.
+    ///
+    /// GTK4 dropped `set_type_hint` with no replacement, so this is applied by
+    /// hand - see `ui::x11`.
+    pub x11_window_type: Option<String>,
+
     /// Tracks pulled per random-play refill.
     pub random_batch: u32,
     pub cache_max_mb: u64,
@@ -56,8 +75,10 @@ impl Default for Config {
             width: 380,
             height: 520,
             hide_on_focus_loss: false,
+            hide_delay_ms: 0,
+            x11_window_type: Some("utility".to_string()),
             random_batch: 100,
-            cache_max_mb: 2048,
+            cache_max_mb: 500,
             prefetch_next: true,
         }
     }
@@ -140,6 +161,10 @@ pub struct Settings {
     /// Stops the no-art panel's pattern from moving. The panel itself stays -
     /// this is about motion, not about the decoration.
     pub reduce_motion: bool,
+    /// Ceiling on the track cache, in megabytes. None means take config.toml's
+    /// `cache_max_mb`, so a value set there still means something until the
+    /// settings page is touched - same arrangement as `hide_on_focus_loss`.
+    pub cache_max_mb: Option<u64>,
     /// Survives a restart alongside the queue itself: coming back to a resumed
     /// queue with repeat silently switched off would be a surprise.
     ///

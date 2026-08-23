@@ -5,6 +5,7 @@ pub mod nowplaying;
 pub mod popup;
 pub mod queue;
 pub mod settings;
+pub mod x11;
 
 use std::future::Future;
 use std::sync::Arc;

@@ -1,0 +1,151 @@
+# Builds the release tarball and publishes it as a Forgejo release.
+#
+# Deliberately uses no third-party actions and no `actions/checkout`: those need
+# a Node runtime inside the container, which the Nix images do not carry, and
+# whether a Forgejo runner injects one depends on how it was set up. Everything
+# here is plain `run:` steps, so it works on any runner that can start the
+# container.
+#
+# Needs, on the repository:
+#   - a runner whose label matches `runs-on` below (`docker` is act_runner's
+#     default for container jobs; change it to whatever `forgejo-runner` declares)
+#   - a secret `RELEASE_TOKEN`: a token with `write:repository` on this repo.
+#     The automatic `${{ github.token }}` may also work depending on the Forgejo
+#     version's default permissions, but an explicit token is predictable.
+#
+# The release body carries the ready-made `prebuiltPin` block for flake.nix. That
+# is not committed automatically: a tag build pushing to the branch it was cut
+# from is the kind of cleverness that goes wrong quietly, so updating the pin
+# stays a deliberate copy-paste.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build a release from"
+        required: true
+
+jobs:
+  release:
+    runs-on: docker
+    container:
+      image: nixos/nix:latest
+    steps:
+      - name: Enable flakes
+        run: |
+          mkdir -p /etc/nix
+          echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
+
+      - name: Clone at the tag
+        env:
+          TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -eu
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            # refs/tags/v1.2.3 -> v1.2.3
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+          # Credentials in the URL rather than in a config file, and the URL is
+          # never echoed: a `set -x` here would put the token in the job log.
+          HOST="${GITHUB_SERVER_URL#https://}"
+          nix shell nixpkgs#git -c git clone --depth 1 --branch "$TAG" \
+            "https://oauth2:$TOKEN@$HOST/$GITHUB_REPOSITORY.git" src
+          cd src
+          nix shell nixpkgs#git -c git rev-parse HEAD
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          set -eu
+          cd src
+          VERSION=$(nix eval --raw \
+            --expr '(builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version' \
+            --impure)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # A tag that disagrees with Cargo.toml would publish an artifact whose
+          # name and whose --version say different things, and the flake pin
+          # builds its URL from the version. Cheaper to stop here.
+          if [ "v$VERSION" != "$TAG" ]; then
+            echo "tag $TAG does not match Cargo.toml version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build the tarball
+        run: |
+          set -eu
+          cd src
+          nix build .#releaseTarball --print-build-logs
+          ARTIFACT="trayplay-$VERSION-x86_64-linux.tar.gz"
+          # Copied out of the store so the upload has a real, writable file with
+          # the name the flake's prebuilt URL expects.
+          cp -L result "../$ARTIFACT"
+          cd ..
+          echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
+          echo "HASH=$(nix hash file --type sha256 --sri "$ARTIFACT")" >> "$GITHUB_ENV"
+
+      - name: Publish the release
+        env:
+          TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -eu
+          API="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+          DOWNLOAD="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG"
+
+          # Heredoc through jq rather than string-pasted JSON: the body carries
+          # newlines and quotes, and hand-escaping those is how these scripts
+          # break.
+          BODY=$(cat <<EOF
+          Prebuilt for x86_64-linux, built by Nix from this tag.
+
+          Install it without compiling by pinning this release in \`flake.nix\`:
+
+          \`\`\`nix
+          prebuiltPin = {
+            version = "$VERSION";
+            baseUrl = "$DOWNLOAD";
+            hash = {
+              x86_64-linux = "$HASH";
+            };
+          };
+          \`\`\`
+
+          Then \`nix build .#prebuilt\`. The binary is linked against the GTK stack of
+          the nixpkgs revision this flake pins; on a consumer whose nixpkgs has moved
+          far enough that sonames differ, autoPatchelf will refuse it and
+          \`nix build .#trayplay\` (from source) is the answer.
+          EOF
+          )
+
+          # Through a file, and with the inner script single-quoted so only the
+          # exported variables expand: the body holds quotes, backticks and
+          # newlines, and inlining that into a nested shell string is how these
+          # break (or leak the token into the log).
+          nix shell nixpkgs#jq -c jq -n \
+            --arg tag "$TAG" --arg name "$TAG" --arg body "$BODY" \
+            '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}' \
+            > release.json
+
+          export API TOKEN ARTIFACT
+          ID=$(nix shell nixpkgs#curl nixpkgs#jq -c sh -c '
+            curl -fsS -X POST "$API/releases" \
+              -H "Authorization: token $TOKEN" \
+              -H "Content-Type: application/json" \
+              --data @release.json | jq -r .id
+          ')
+          echo "release id: $ID"
+
+          export ID
+          nix shell nixpkgs#curl -c sh -c '
+            curl -fsS -X POST "$API/releases/$ID/assets?name=$ARTIFACT" \
+              -H "Authorization: token $TOKEN" \
+              -F "attachment=@$ARTIFACT"
+          ' > /dev/null
+
+          echo "published $ARTIFACT with hash $HASH"

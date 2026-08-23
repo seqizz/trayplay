@@ -19,9 +19,11 @@ use super::Session;
 /// short enough that it is gone by the next interaction.
 const TOAST_TIMEOUT_SECS: u32 = 5;
 
-/// How often auto-hide reconsiders a blur it skipped because a row menu was
-/// open. Only runs while such a menu is up, and stops at the first decision.
-const MENU_HIDE_RECHECK: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long a hide waits while a row menu is open before looking again.
+///
+/// Unrelated to `hide_delay_ms`: this one is not a grace period but a poll, since
+/// a menu closing produces no event on the window itself.
+const MENU_RECHECK: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// How long after losing focus a tray click still counts as "the user was using
 /// this", and therefore closes the popup rather than raising it.
@@ -91,7 +93,12 @@ impl Popup {
                 let nav = adw::NavigationView::new();
                 nav.set_widget_name("trayplay-nav");
 
-                let now_playing = build_now_playing(&nav, session, hide_on_blur.clone());
+                let now_playing = build_now_playing(
+                    &nav,
+                    session,
+                    hide_on_blur.clone(),
+                    cfg.cache_max_mb,
+                );
                 nav.add(&now_playing.0);
                 wire_shortcuts(&window, &nav, &now_playing.1);
 
@@ -119,6 +126,19 @@ impl Popup {
             None => window.set_content(Some(&signed_out_page())),
         }
 
+        // Before the first map, so the window manager sees the type it is
+        // supposed to manage this window as. X11 only: on Wayland there is no
+        // such property, and no rules keyed off one.
+        if let Some(kind) = cfg.x11_window_type.clone() {
+            if display.backend().is_x11() {
+                window.connect_realize(move |win| {
+                    if let Err(err) = super::x11::set_window_type(win, &kind) {
+                        tracing::warn!(%err, kind, "cannot set the X11 window type");
+                    }
+                });
+            }
+        }
+
         // Layer-shell setup must happen before the surface is realized.
         // gtk4_layer_shell::is_supported() asserts GDK_IS_WAYLAND_DISPLAY
         // internally and logs a CRITICAL on X11, so check the backend first.
@@ -138,7 +158,12 @@ impl Popup {
         }
 
         let unfocused_since = Rc::new(Cell::new(None));
-        Self::wire_dismiss(&window, hide_on_blur, unfocused_since.clone());
+        Self::wire_dismiss(
+            &window,
+            hide_on_blur,
+            unfocused_since.clone(),
+            std::time::Duration::from_millis(cfg.hide_delay_ms),
+        );
 
         Self {
             window,
@@ -150,6 +175,7 @@ impl Popup {
         window: &adw::ApplicationWindow,
         hide_on_blur: Rc<Cell<bool>>,
         unfocused_since: Rc<Cell<Option<Instant>>>,
+        hide_delay: std::time::Duration,
     ) {
         let keys = gtk::EventControllerKey::new();
         keys.connect_key_pressed(|controller, key, _code, _mods| {
@@ -162,6 +188,10 @@ impl Popup {
             glib::Propagation::Proceed
         });
         window.add_controller(keys);
+
+        // Set while a hide is waiting, so focus flapping does not pile up a timer
+        // per blur.
+        let pending_hide = Rc::new(Cell::new(false));
 
         // Connected unconditionally and gated on the flag, so the settings switch
         // takes effect immediately instead of at the next start.
@@ -177,30 +207,7 @@ impl Popup {
             if !hide_on_blur.get() || win.is_active() {
                 return;
             }
-            // A row menu is a surface of its own, so opening one deactivates this
-            // window. Hiding then would take the popup away under the menu the
-            // user just opened.
-            if super::menu_is_open() {
-                // Deferred rather than dropped: if the menu is dismissed by a
-                // click on another window, focus never returns here and no
-                // further is-active notify arrives to reconsider this.
-                let win_weak = win.downgrade();
-                let hide_on_blur = hide_on_blur.clone();
-                glib::timeout_add_local(MENU_HIDE_RECHECK, move || {
-                    let Some(win) = win_weak.upgrade() else {
-                        return glib::ControlFlow::Break;
-                    };
-                    if super::menu_is_open() {
-                        return glib::ControlFlow::Continue;
-                    }
-                    if hide_on_blur.get() && !win.is_active() {
-                        win.set_visible(false);
-                    }
-                    glib::ControlFlow::Break
-                });
-                return;
-            }
-            win.set_visible(false);
+            schedule_hide(win, hide_on_blur.clone(), pending_hide.clone(), hide_delay);
         });
     }
 
@@ -243,6 +250,49 @@ impl Popup {
     pub fn hide(&self) {
         self.window.set_visible(false);
     }
+}
+
+/// Hides the popup once it has stayed unfocused, `delay` after the blur.
+///
+/// Always through a timeout, even for a zero delay - that lands on the next
+/// main-loop turn, which is immediate enough while still letting the checks below
+/// run once, in one place.
+///
+/// The delay is configurable and defaults to zero because it is a trade, not an
+/// improvement. It swallows focus that bounces straight back (a click landing on
+/// the popup), but everything a window manager or compositor does with a window
+/// that is about to vanish - restacking it, fading it, re-redirecting the screen
+/// around a fullscreen window - happens in full view for exactly that long.
+///
+/// A row menu is a separate surface and holds focus while it is open, so that case
+/// re-arms instead of hiding. Re-arming rather than dropping the blur also covers
+/// the menu being dismissed by a click on another window: focus never returns
+/// here, so no second `is-active` notify would ever arrive to reconsider.
+fn schedule_hide(
+    window: &adw::ApplicationWindow,
+    hide_on_blur: Rc<Cell<bool>>,
+    pending: Rc<Cell<bool>>,
+    delay: std::time::Duration,
+) {
+    // Already waiting: the decision it makes is the same one this call would.
+    if pending.replace(true) {
+        return;
+    }
+
+    let weak = window.downgrade();
+    glib::timeout_add_local_once(delay, move || {
+        pending.set(false);
+        let Some(window) = weak.upgrade() else { return };
+        // Focus came back, or the setting was turned off while waiting.
+        if !hide_on_blur.get() || window.is_active() {
+            return;
+        }
+        if super::menu_is_open() {
+            schedule_hide(&window, hide_on_blur, pending, MENU_RECHECK);
+            return;
+        }
+        window.set_visible(false);
+    });
 }
 
 /// Routes single-key shortcuts to the root view.
@@ -313,10 +363,12 @@ fn build_now_playing(
     nav: &adw::NavigationView,
     session: Session,
     hide_on_blur: Rc<Cell<bool>>,
+    cache_limit_mb: u64,
 ) -> (adw::NavigationPage, Rc<NowPlaying>) {
     let nav_weak = nav.downgrade();
     let session_nav = session.clone();
     let session_queue = session.clone();
+    let session_settings = session.clone();
 
     // The navigation closure is built before the view it navigates *from* exists,
     // so the settings page cannot capture it directly. It is filled in below and
@@ -341,6 +393,8 @@ fn build_now_playing(
                 nav.push(&super::settings::page(
                     hide_on_blur.clone(),
                     on_reduce_motion,
+                    &session_settings,
+                    cache_limit_mb,
                 ));
             }
             Navigate::Artist { id, name } => push_albums(&nav, &session_nav, &id, &name),
@@ -860,7 +914,7 @@ thread_local! {
     /// (`build` early-returns on a second `activate`) with everything that could
     /// raise a toast living on the GTK thread. `Toaster` itself is `Rc` and
     /// holds widgets, so it could not be a plain static anyway.
-    static TOASTER: RefCell<Option<Rc<Toaster>>> = RefCell::new(None);
+    static TOASTER: RefCell<Option<Rc<Toaster>>> = const { RefCell::new(None) };
 }
 
 /// Transient error banner stacked over the whole window.

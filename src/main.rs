@@ -178,7 +178,13 @@ fn start_player(
 
     let cache = Arc::new(player::cache::Cache::new(
         config::cache_dir()?,
-        cfg.cache_max_mb * 1024 * 1024,
+        // The settings page's value wins; config.toml is the fallback for
+        // anyone who set it there before the page existed.
+        config::Settings::load()
+            .cache_max_mb
+            .unwrap_or(cfg.cache_max_mb)
+            * 1024
+            * 1024,
         client.http(),
     )?);
     if let Err(err) = cache.prune() {

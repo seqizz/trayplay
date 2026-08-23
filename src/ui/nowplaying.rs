@@ -80,11 +80,6 @@ pub struct NowPlaying {
     /// Cover art, drawn behind everything, sharp at the top and blurred lower
     /// down where the text sits.
     backdrop: ArtBackdrop,
-    /// Reserves room at the top for the art to show through. Always present and
-    /// expanding, so the controls stay bottom-anchored; its minimum height comes
-    /// from CSS and only applies under `.has-art`, which keeps an artless
-    /// library from showing a large empty gap.
-    art_space: gtk::Widget,
     title: gtk::Label,
     /// One button per credited artist, scrollable when they do not fit.
     artists: ArtistStrip,
@@ -137,6 +132,11 @@ impl NowPlaying {
         let backdrop = ArtBackdrop::new();
         backdrop.set_widget_name("trayplay-art");
 
+        // Reserves room at the top for the art to show through. Always present
+        // and expanding, so the controls stay bottom-anchored; its minimum height
+        // comes from CSS and applies only under `.has-art`, which is what lets a
+        // "nothing playing" popup collapse to a compact layout. Not kept as a
+        // field: nothing touches it again after construction.
         let art_space = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
@@ -294,7 +294,6 @@ impl NowPlaying {
         let this = Rc::new(Self {
             root: root.upcast(),
             backdrop,
-            art_space: art_space.upcast(),
             title,
             artists,
             album,
@@ -798,18 +797,24 @@ fn glyph_button(image: &gtk::Image, name: &str) -> gtk::Button {
     button
 }
 
-/// Text for the no-cover panel, and with it the colour: the hash of this string
-/// is what picks the hue, so it has to be the album rather than the track, or
-/// every track of a record would be a different colour.
+/// Text for the no-cover panel, and with it the colour and the font: the hash of
+/// this string picks both, so it has to be the album rather than the track, or
+/// every track of a record would look different.
+///
+/// Falling back to the credited artists (all of them) and then to the title, for
+/// the badly tagged corners of a library where a track has neither.
 fn placeholder_text(item: &Item) -> String {
     if let Some(album) = &item.album {
         if !album.is_empty() {
             return album.clone();
         }
     }
-    let artist = item.display_artist();
-    if artist != "Unknown Artist" {
-        return artist.to_string();
+    // Every credited artist, not just the first: a collaboration with no album
+    // and no cover would otherwise put one name on the panel and list both in the
+    // tags right underneath it.
+    let artists = item.display_artists();
+    if artists != "Unknown Artist" {
+        return artists;
     }
     item.name.clone()
 }

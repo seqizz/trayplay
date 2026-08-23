@@ -29,10 +29,47 @@ matching `ButtonRelease` for the same detail, so a single notch does not fire tw
 `TrayIconEvent` is `#[non_exhaustive]` upstream, so this is additive - nothing upstream
 already matching on it needed a wildcard arm added, that discipline was already required.
 
+## The second functional change: surviving a tray restart (patch2)
+
+Upstream docks **once**, in `TrayIconImpl::new`: it reads the owner of
+`_NET_SYSTEM_TRAY_S0`, sends one `SYSTEM_TRAY_REQUEST_DOCK`, and never considers docking
+again. It also never selects for events on the root window, so it cannot hear a tray
+announcing itself, and it ignores `ReparentNotify` on its own icon window.
+
+That breaks the moment the tray goes away and comes back. AwesomeWM rebuilds its wibars
+when the screen layout changes - plug in a monitor, or move the systray to another screen -
+and every embedded icon is **reparented back to the root window**. A mapped
+`InputOutput` window sitting on the root is just an ordinary client, so the window manager
+picks it up and decorates it: the icon becomes a stray 24x24 window with `WM_STATE: Normal`,
+`_NET_WM_DESKTOP` and frame extents, still carrying `_XEMBED_INFO` from its former life,
+while the tray itself shows nothing. Reported against trayplay exactly that way.
+
+Three additions, all in `linux.rs` and all marked `PATCH (trayplay)`:
+
+1. `new` selects `StructureNotify` on the **root** window. ICCCM has a manager broadcast
+   its `MANAGER` ClientMessage there, and this is the only way to hear it. Per-client event
+   masks, so the window manager's own selection is untouched.
+2. The event loop handles three more events:
+   - `ReparentNotify` to the root: **unmap immediately** (so the WM never manages it) and
+     start trying to dock again.
+   - `ReparentNotify` to anything else: embedded again, stop trying.
+   - `ClientMessage` of type `MANAGER` for `_NET_SYSTEM_TRAY_S0`: a tray started or
+     restarted, so try to dock.
+3. `try_dock` re-reads the selection owner every time rather than reusing the one from
+   construction - a restarted tray owns a *different* window, and a request sent to the old
+   one goes nowhere - and re-asserts `_XEMBED_INFO` before asking.
+
+The retry loop matters as much as the trigger. One request at the moment of eviction is
+not enough: the bar being rebuilt usually has no systray widget yet, the request lands
+nowhere, and no further event ever arrives to prompt another attempt. So while undocked,
+`try_dock` runs about once a second from the poll loop's idle branch.
+
 ## Re-syncing with a newer upstream version
 
-Re-apply both pieces to the new source: the `Scroll` variant in `tray.rs` (including its
-`id()` match arm), and the `handle_event` changes in `linux.rs` (search for
-`_ => MouseButton::Left`). Re-diff `Cargo.toml.orig` against this directory's `Cargo.toml`
-for any new Linux-relevant dependencies. If a future upstream release adds real scroll
-support itself, drop this vendored copy entirely and go back to the crates.io dependency.
+Re-apply all three pieces to the new source: the `Scroll` variant in `tray.rs` (including
+its `id()` match arm), the `handle_event` changes in `linux.rs` (search for
+`_ => MouseButton::Left`), and the re-docking work (`try_dock`, the root event mask, the
+`ReparentNotify`/`MANAGER` arms and the idle retry). Re-diff `Cargo.toml.orig` against this
+directory's `Cargo.toml` for any new Linux-relevant dependencies. If a future upstream
+release grows real scroll support *and* handles re-docking, drop this vendored copy and go
+back to the crates.io dependency.

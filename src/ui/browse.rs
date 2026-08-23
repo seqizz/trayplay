@@ -25,6 +25,16 @@ const GLIDE_SECONDS: f64 = 0.3;
 /// Release speed below which there was no flick, just a stop. Pixels per second.
 const GLIDE_MIN_VELOCITY: f64 = 80.0;
 
+/// A row's subtitle, computed per item because a section decides what its own
+/// rows say underneath the name.
+type SubtitleFn = Box<dyn Fn(&Item) -> Option<String>>;
+
+/// What activating a row does, by row index within its section.
+type ActivateFn = Box<dyn Fn(usize)>;
+
+/// Label and callback for a list page's header button ("Play").
+type HeaderAction<'a> = Option<(&'a str, Box<dyn Fn()>)>;
+
 /// One entry in a row's right-click menu.
 ///
 /// `Rc` rather than `Box` because the same callback is reached two ways: the
@@ -54,8 +64,8 @@ pub struct Section {
     /// subtitle already says what the rows are.
     pub heading: Option<String>,
     pub items: Vec<Item>,
-    pub subtitle_of: Box<dyn Fn(&Item) -> Option<String>>,
-    pub on_activate: Box<dyn Fn(usize)>,
+    pub subtitle_of: SubtitleFn,
+    pub on_activate: ActivateFn,
     /// Right-click menu for this section's rows. Empty means no menu.
     pub menu: Vec<RowAction>,
 }
@@ -171,9 +181,9 @@ impl LiveList {
 pub struct ListPage;
 
 impl ListPage {
-    /// Single-section page that opens scrolled to `scroll_to` instead of the top
-    /// - the queue page's "don't make me scroll to find what's playing" request -
-    /// and hands back a handle for replacing its rows afterwards.
+    /// Single-section page that opens scrolled to `scroll_to` instead of the
+    /// top, and hands back a handle for replacing its rows afterwards. The queue
+    /// page's "don't make me scroll to find what's playing" request.
     ///
     /// Kept separate from the plain `build` rather than adding two parameters
     /// every other caller would have to pass `None` for. The queue is the only
@@ -220,7 +230,7 @@ impl ListPage {
         title: &str,
         kind: &str,
         sections: Vec<Section>,
-        header_action: Option<(&str, Box<dyn Fn()>)>,
+        header_action: HeaderAction,
     ) -> adw::NavigationPage {
         Self::build_inner(title, kind, sections, header_action, None).0
     }
@@ -231,7 +241,7 @@ impl ListPage {
         title: &str,
         kind: &str,
         sections: Vec<Section>,
-        header_action: Option<(&str, Box<dyn Fn()>)>,
+        header_action: HeaderAction,
         scroll_to: Option<usize>,
     ) -> (
         adw::NavigationPage,

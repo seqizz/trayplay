@@ -47,6 +47,25 @@ impl Queue {
         self.items.splice(at..at, items);
     }
 
+    /// Drops the track at the cursor, which [`Queue::remove`] refuses to touch.
+    ///
+    /// Only for a track that cannot be played at all - the caller is responsible
+    /// for the sink, which is still holding it. Returns whether the cursor now
+    /// points at a track that *followed* it: removing shifts the tail down, so
+    /// the cursor lands on the successor for free. False means there was none,
+    /// and the cursor has been clamped back into range.
+    pub fn remove_current(&mut self) -> bool {
+        if self.cursor >= self.items.len() {
+            return false;
+        }
+        let had_successor = self.cursor + 1 < self.items.len();
+        self.items.remove(self.cursor);
+        if !had_successor {
+            self.cursor = self.items.len().saturating_sub(1);
+        }
+        had_successor
+    }
+
     /// Drops one track. False when there is nothing at `index`, or when it is
     /// the track playing right now - removing that would leave the sink playing
     /// something the queue no longer contains.

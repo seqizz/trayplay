@@ -2,11 +2,30 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
+
+/// The server has no file for this item any more: a 404 on the stream URL.
+///
+/// Its own type so the player can tell it apart from a network failure and act on
+/// it - dropping the track rather than retrying something that cannot succeed.
+/// Jellyfin derives item ids from file paths, so a reorganised library turns
+/// every remembered id into one of these, and trayplay remembers a whole queue
+/// across restarts.
+#[derive(Debug, Clone, Copy)]
+pub struct Gone;
+
+impl std::fmt::Display for Gone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the server no longer has this track (404)")
+    }
+}
+
+impl std::error::Error for Gone {}
 
 /// Progressive on-disk track cache.
 ///
@@ -21,7 +40,9 @@ use tokio::io::AsyncWriteExt;
 pub struct Cache {
     dir: PathBuf,
     http: reqwest::Client,
-    max_bytes: u64,
+    /// Atomic because the settings page can change it while tracks are
+    /// downloading, and every download finishes by pruning against it.
+    max_bytes: AtomicU64,
     /// Downloads currently running, so a prefetch and a play of the same track
     /// share one HTTP request instead of racing each other.
     inflight: Mutex<HashMap<String, Inflight>>,
@@ -105,9 +126,38 @@ impl Cache {
         Ok(Self {
             dir,
             http,
-            max_bytes,
+            max_bytes: AtomicU64::new(max_bytes),
             inflight: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Changes the ceiling. The caller prunes if it wants the new one applied
+    /// now rather than after the next download.
+    pub fn set_max_bytes(&self, max_bytes: u64) {
+        self.max_bytes.store(max_bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes currently held, counting only finished entries - the same set
+    /// `prune` measures, so the two agree about what "full" means.
+    ///
+    /// A free function taking the directory rather than a method, because the
+    /// settings page wants this and has no reason to be handed the whole cache.
+    pub fn size_of(dir: &std::path::Path) -> u64 {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "part")
+            })
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
+            .sum()
     }
 
     /// True when a complete local copy exists, so a reader will never block.
@@ -277,6 +327,17 @@ impl Cache {
             .await
             .with_context(|| format!("GET {key}"))
             .and_then(|resp| {
+                // 404 is called out rather than folded into the generic error
+                // because it is not a transient failure: the item id no longer
+                // resolves to a file on the server, so retrying it - or leaving
+                // it in the queue to come round again - accomplishes nothing.
+                // Jellyfin derives item ids from paths, so a library that has
+                // been reorganised leaves exactly this behind in anything that
+                // remembered the old ids, including our own restored queue.
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Err(anyhow::Error::new(Gone)
+                        .context(format!("streaming {key}")));
+                }
                 resp.error_for_status()
                     .with_context(|| format!("streaming {key}"))
             })
@@ -383,13 +444,14 @@ impl Cache {
             entries.push((path, meta.len(), meta.modified()?));
         }
 
-        if total <= self.max_bytes {
+        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
+        if total <= max_bytes {
             return Ok(());
         }
 
         entries.sort_by_key(|(_, _, used)| *used);
         for (path, len, _) in entries {
-            if total <= self.max_bytes {
+            if total <= max_bytes {
                 break;
             }
             match fs::remove_file(&path) {

@@ -1,6 +1,6 @@
 [package]
 name = "tray"
-version = "0.1.2-trayplay-patch1"
+version = "0.1.2-trayplay-patch2"
 edition = "2024"
 description = "Cross-platform tray icon library, with egui and iced support (trimmed to Linux/X11 only, with a local scroll-wheel fix - see PATCH.md)"
 license = "MIT"

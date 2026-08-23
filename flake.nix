@@ -239,13 +239,18 @@
           '';
         };
 
+        # No rustfmt check on purpose. The layout here is hand-written - comment
+        # wrapping and argument breaks are chosen to read a certain way - and
+        # rustfmt disagrees with most of it. Enforcing it would mean one
+        # mechanical reflow of the whole tree and then living with its opinions
+        # about every comment thereafter. Clippy *is* enforced, warnings denied,
+        # because that catches mistakes rather than style.
         checks = {
           inherit trayplay;
           clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
             cargoClippyExtraArgs = "--all-targets -- --deny warnings";
           });
-          fmt = craneLib.cargoFmt { inherit (commonArgs) src; };
         };
       });
 }

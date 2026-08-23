@@ -31,6 +31,13 @@ ksni = { version = "0.3", default-features = false, features = ["tokio"] }
 # popup open/shut. See vendor/tray/PATCH.md.
 tray = { path = "vendor/tray" }
 
+# Setting _NET_WM_WINDOW_TYPE on the popup needs both: GTK4 dropped
+# gtk_window_set_type_hint with no replacement, so the property has to be set by
+# hand. gdk4-x11 turns the GdkSurface into an XID; x11rb (already here as the
+# vendored tray's dependency) changes the property.
+gdk4-x11 = "0.9"
+x11rb = "0.13"
+
 # Runtime / plumbing
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 async-channel = "2"
