@@ -1,0 +1,88 @@
+[package]
+name = "trayplay"
+version = "0.1.0"
+edition = "2021"
+description = "Systray Jellyfin music player with MPRIS support"
+license = "MIT"
+
+# Version requirements below are starting points. This machine has no crates.io
+# access, so run `cargo update` (or `cargo add <crate>` per line) on a networked
+# host to pin the actual current releases before the first build.
+[dependencies]
+# UI
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+gtk4-layer-shell = "0.4"
+
+# MPRIS. zbus 5 to match ksni, so the process runs one D-Bus stack.
+mpris-server = "0.9"
+
+# Tray (StatusNotifierItem, Wayland/somewm).
+# 0.3 switched from dbus-rs to zbus, which drops the libdbus C dependency and
+# shares the D-Bus stack with mpris-server instead of running a second one.
+ksni = { version = "0.3", default-features = false, features = ["tokio"] }
+
+# Tray (XEmbed, X11). GTK4 dropped GtkStatusIcon and its own surfaces cannot
+# tolerate being reparented into a systray by an external window manager
+# (confirmed against AwesomeWM - see src/tray/xembed.rs), so this owns a raw
+# X11 window outside GDK entirely instead of trying to dock a gtk::Window.
+# Vendored (not crates.io 0.1.2 directly): upstream misreports X11 scroll
+# wheel notches as left clicks, which made scrolling the tray icon toggle the
+# popup open/shut. See vendor/tray/PATCH.md.
+tray = { path = "vendor/tray" }
+
+# Runtime / plumbing
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+async-channel = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Audio. Symphonia decoders only for what the library actually holds; anything
+# else is handled by asking Jellyfin to transcode instead of linking ffmpeg.
+rodio = { version = "0.20", default-features = false, features = [
+  "symphonia-flac",
+  "symphonia-mp3",
+  "symphonia-aac",
+  "symphonia-vorbis",
+  "symphonia-isomp4",
+  # ALAC also lives in an MP4 container, so m4a files may be either.
+  "symphonia-alac",
+  "symphonia-wav",
+] }
+
+# rodio's "symphonia-vorbis" enables the Vorbis *codec* but not the Ogg
+# *container* reader, and rodio exposes no feature that does. Depending on
+# symphonia directly turns it on through Cargo's feature unification: rodio's
+# copy of symphonia gains the feature too. Without this, .ogg files fail to probe
+# and the decoder reports "end of stream".
+symphonia = { version = "0.5", default-features = false, features = ["ogg"] }
+futures-util = "0.3"
+
+# Jellyfin client.
+# rustls-tls-native-roots rather than plain rustls-tls so the system CA store is
+# honoured (self-hosted servers behind a private CA), and no openssl in the closure.
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "stream",
+  "http2",
+  "charset",
+  "rustls-tls-native-roots",
+] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+urlencoding = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+notify = "6"
+
+[profile.release]
+lto = "thin"
+strip = true

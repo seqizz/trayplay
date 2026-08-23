@@ -1,0 +1,23 @@
+[package]
+name = "tray"
+version = "0.1.2-trayplay-patch1"
+edition = "2024"
+description = "Cross-platform tray icon library, with egui and iced support (trimmed to Linux/X11 only, with a local scroll-wheel fix - see PATCH.md)"
+license = "MIT"
+authors = ["nobane"]
+repository = "https://github.com/nobane/tray-rs"
+
+[features]
+default = []
+serde = ["dep:serde", "dpi/serde"]
+
+[dependencies]
+crossbeam-channel = "0.5"
+once_cell = "1"
+thiserror = "2"
+serde = { version = "1", optional = true, features = ["derive"] }
+dpi = "0.1"
+x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+# error.rs's PngEncodingError variant is `cfg(any(linux, macos))`, so this is
+# needed even though nothing in the Linux code path actually constructs it.
+png = "0.17"

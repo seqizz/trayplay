@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Icons are shipped as a GResource bundle rather than installed files: GTK can
+     only look symbolic icons up from a resource path or an icon theme directory,
+     and a bundle keeps the binary self-contained the way data/default.css is.
+
+     Paths here are relative to data/icons and are appended to the prefix, so a
+     new icon is one line plus the file. -->
+<gresources>
+  <gresource prefix="/dev/trayplay/Trayplay/icons">
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-shuffle-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-library-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-queue-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-prev-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-play-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-pause-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-next-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-settings-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-music-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-repeat-off-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-repeat-all-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-repeat-one-symbolic.svg</file>
+  </gresource>
+</gresources>

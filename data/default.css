@@ -1,0 +1,374 @@
+/* trayplay baseline theme.
+ *
+ * This file is compiled into the binary and loaded at APPLICATION priority.
+ * User overrides go in $XDG_CONFIG_HOME/trayplay/theme.css and are loaded at
+ * USER priority, so they win without having to restate everything here.
+ *
+ * Selector names are a stability contract for theme authors. See README.
+ */
+
+/* ── Translucency ─────────────────────────────────────────────────────────
+ * The blur is the compositor's job: GTK has no blur-behind property, so this
+ * only makes the window translucent and picom (blur-background = true) blurs
+ * whatever shows through. Under Wayland the translucency still applies but the
+ * blur depends on the compositor implementing it.
+ *
+ * Several nested containers paint their own opaque background over the
+ * window's, so they have to be cleared first. Node names that do not exist
+ * simply never match, which is why listing the ones libadwaita may or may not
+ * use costs nothing.
+ */
+#trayplay-popup,
+#trayplay-popup > *,
+#trayplay-popup .background,
+#trayplay-popup navigation-view,
+#trayplay-popup toolbarview,
+#trayplay-popup .toolbar,
+#trayplay-popup .top-bar,
+#trayplay-popup headerbar,
+#trayplay-popup scrolledwindow,
+#trayplay-popup viewport,
+#trayplay-popup list,
+#trayplay-popup listview {
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+/* One translucent tint, on the window only. Same specificity as the reset
+ * above but declared after it, so it wins. Lower the alpha for more blur
+ * showing through, raise it for readability. */
+#trayplay-popup {
+  background-color: alpha(@window_bg_color, 0.55);
+  border-radius: 12px;
+}
+
+/* White is heavier than the same alpha of a dark colour: it hides the art and
+ * flattens everything into a sheet, where dark reads as depth. So the light
+ * palette gets a thinner tint, and a weaker scrim further down. */
+#trayplay-popup.light {
+  background-color: alpha(@window_bg_color, 0.42);
+}
+
+#trayplay-popup headerbar {
+  border-bottom: 1px solid alpha(@borders, 0.4);
+}
+
+.trayplay-body {
+  padding: 12px;
+}
+
+/* Cover art sits behind everything, blurred, and is faded out by the scrim so
+ * text stays readable. A track with no art gets a generated panel instead (a
+ * gradient derived from the album name, with that name tiled across it on an
+ * angle and slowly sliding - see src/ui/artwork.rs), so `.has-art` stays set and
+ * the space is still reserved. Only "nothing playing" collapses it. */
+/* Do not set `filter: blur()` here. #trayplay-art is a custom widget that draws
+ * its own sharp-to-blurred vertical gradient (CSS blur is uniform across a
+ * widget and cannot do that); a filter would blur the sharp part too.
+ * Blur radius and fade band live in src/ui/artwork.rs. */
+/* Held well below 1: a bright cover otherwise washes the whole popup out, and
+ * the art is meant to be atmosphere behind the text rather than the subject. */
+#trayplay-art {
+  opacity: 0.8;
+}
+
+#trayplay-art-space {
+  min-height: 0;
+}
+
+.has-art #trayplay-art-space {
+  min-height: 170px;
+}
+
+/* The scrim carries the window colour over the art, so in dark mode this is what
+ * actually makes the lower half dark. It has to get most of the way to opaque:
+ * stopping at 0.62 left a bright cover showing through as a pale haze, which
+ * read as "not dark at all" however dark the palette was. It still stops short of
+ * 1 so the compositor keeps something to blur.
+ *
+ * Many stops rather than four: the ramp is long, and a long ramp with few stops
+ * bands visibly. */
+#trayplay-scrim {
+  background-image: linear-gradient(
+    to bottom,
+    alpha(@window_bg_color, 0) 0%,
+    alpha(@window_bg_color, 0.15) 18%,
+    alpha(@window_bg_color, 0.4) 32%,
+    alpha(@window_bg_color, 0.65) 46%,
+    alpha(@window_bg_color, 0.8) 60%,
+    alpha(@window_bg_color, 0.86) 75%,
+    alpha(@window_bg_color, 0.88) 100%
+  );
+}
+
+/* Same ramp, roughly two thirds of the strength. Text stays readable because it
+ * is dark on a light scrim, which needs far less separation than light text on a
+ * dark one. */
+#trayplay-popup.light #trayplay-scrim {
+  background-image: linear-gradient(
+    to bottom,
+    alpha(@window_bg_color, 0) 0%,
+    alpha(@window_bg_color, 0.1) 18%,
+    alpha(@window_bg_color, 0.26) 32%,
+    alpha(@window_bg_color, 0.42) 46%,
+    alpha(@window_bg_color, 0.54) 60%,
+    alpha(@window_bg_color, 0.58) 75%,
+    alpha(@window_bg_color, 0.6) 100%
+  );
+}
+
+/* Text sits over arbitrary wallpaper once the window is translucent, so it
+ * carries its own shadow rather than relying on a background. */
+/* Title, artists and album, grouped so a track change can fade them in as one
+ * (opacity is animated from src/ui/nowplaying.rs; do not set it here). */
+#trayplay-tags {
+  margin-bottom: 4px;
+}
+
+#trayplay-title {
+  margin-top: 4px;
+  font-weight: bold;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+/* Artist and album are buttons so they can navigate, but should not read as
+ * buttons until hovered. There is one artist button per credited artist, inside
+ * the scrollable #trayplay-artists strip. */
+.trayplay-artist,
+#trayplay-album {
+  padding: 0 4px;
+  min-height: 0;
+}
+
+#trayplay-album {
+  font-size: 0.9em;
+}
+
+/* Elapsed time: GtkScale's own `value` label, drawn above the handle and
+ * following it.
+ *
+ * Always drawn, so its height is always part of the widget and the rows below
+ * never move; visibility is opacity only. Toggling `draw-value` instead resized
+ * the scale whenever the pointer crossed it. */
+#trayplay-seek value {
+  font-size: 0.8em;
+  padding-bottom: 2px;
+  opacity: 0;
+}
+
+#trayplay-seek.showing-value value {
+  opacity: 0.9;
+}
+
+/* Seek bar.
+ *
+ * GtkScale's node tree is `scale > trough > {highlight, slider}`, so the played
+ * portion is `highlight` and the handle is `slider` - neither is reachable from
+ * the #trayplay-seek node itself.
+ *
+ * The played portion follows the foreground colour rather than the accent: it
+ * ends up white on a dark palette and black on a light one, which reads as part
+ * of the art instead of as a stray blue. */
+#trayplay-seek trough {
+  background-color: alpha(@window_fg_color, 0.22);
+  min-height: 4px;
+  border-radius: 2px;
+}
+
+#trayplay-seek trough highlight {
+  background-color: alpha(@window_fg_color, 0.85);
+  border-radius: 2px;
+}
+
+/* No handle at rest: a dot parked on the bar draws the eye for no reason. The
+ * position is already legible from where the fill ends. Sized to nothing rather
+ * than hidden, so the trough still spans the full width. */
+#trayplay-seek slider {
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  border-width: 0;
+}
+
+/* While being used, a translucent block instead - enough to aim with, without
+ * becoming a control in its own right. Wider than it is tall, so it reads as a
+ * segment of the bar rather than as a handle sitting on it. Both states are
+ * needed: hover for pointing at it, active for the drag itself, when the pointer
+ * may have left. */
+#trayplay-seek:hover slider,
+#trayplay-seek:active slider {
+  min-width: 18px;
+  min-height: 8px;
+  margin: -2px 0;
+  border-radius: 2px;
+  background-color: alpha(@window_fg_color, 0.55);
+}
+
+/* Waiting for a seek to actually take effect: the player may still be finishing
+ * a download before it can position the decoder, which is otherwise entirely
+ * invisible. The fill pulses for as long as `.seeking` is set (see
+ * src/ui/nowplaying.rs). Longhands rather than the `animation` shorthand, which
+ * GTK does not parse. */
+@keyframes trayplay-seek-pulse {
+  from {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+#trayplay-seek.seeking trough highlight {
+  animation-name: trayplay-seek-pulse;
+  animation-duration: 900ms;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+}
+
+/* Full opacity plus a shadow instead of dimming: dimmed text over a blurred
+ * backdrop stops being readable. */
+.trayplay-artist,
+#trayplay-album {
+  opacity: 1;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+
+/* Dark text does not need a dark halo - it only muddies it. */
+#trayplay-popup.light #trayplay-title,
+#trayplay-popup.light .trayplay-artist,
+#trayplay-popup.light #trayplay-album,
+#trayplay-popup.light #trayplay-seek value {
+  text-shadow: 0 1px 2px alpha(@window_bg_color, 0.8);
+}
+
+#trayplay-popup.light button.trayplay-glyph {
+  filter: drop-shadow(0 1px 2px alpha(@window_bg_color, 0.8));
+}
+
+/* The strip fades its own edges when there is more to scroll to, so it must not
+ * be given a background: the fade is a mask over what it draws, and a filled
+ * background would be masked into a visible wedge. */
+#trayplay-artists {
+  background-color: transparent;
+}
+
+/* Shadow only: the opacity above is what shows and hides it. */
+#trayplay-seek value {
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+
+#trayplay-transport {
+  margin-top: 4px;
+}
+
+/* Play/pause reads as primary through size and full opacity rather than through
+ * an accent fill. The size itself is GLYPH_SIZE/PLAY_GLYPH_SIZE in
+ * src/ui/nowplaying.rs: it is set on the image with set_pixel_size, which CSS
+ * cannot override. */
+#trayplay-play {
+  opacity: 1;
+}
+
+/* Repeat is the one transport control with a state to show. The three glyphs are
+ * similar enough at this size (a plain arrow, a loop, a loop with a "1") that
+ * shape alone is a weak signal, so an active repeat is also brighter than the
+ * rest of the row. */
+#trayplay-repeat.repeat-active {
+  opacity: 1;
+}
+
+/* Transport controls are glyphs, not buttons: no pill, no square, no accent
+ * fill.
+ *
+ * The longhands are spelled out on purpose. `background: none` leaves
+ * background-color alone, which is the property Adwaita actually uses to draw a
+ * button, so the faint square survived. The selector is `button.trayplay-glyph`
+ * rather than the bare class for the same kind of reason: libadwaita styles
+ * buttons through selectors like `button.image-button`, and matching its
+ * specificity keeps this from depending on provider priority alone.
+ *
+ * Every state has to be listed - flat buttons still fill on hover and active -
+ * and min-width/min-height have to go or the button keeps the footprint of the
+ * shape that is no longer drawn. */
+button.trayplay-glyph,
+button.trayplay-glyph:hover,
+button.trayplay-glyph:active,
+button.trayplay-glyph:checked,
+button.trayplay-glyph:focus,
+button.trayplay-glyph:disabled {
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  border-width: 0;
+  border-color: transparent;
+  outline: none;
+  min-width: 0;
+  min-height: 0;
+  padding: 2px 6px;
+}
+
+button.trayplay-glyph {
+  opacity: 0.8;
+  /* Same reason as the text shadows: with no fill behind it, a glyph needs its
+   * own contrast against whatever the compositor is blurring. */
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.7));
+}
+
+button.trayplay-glyph:hover {
+  opacity: 1;
+}
+
+/* Square, and only as wide as the glyph: a utility button, not a third
+ * destination next to Library and Queue. */
+#trayplay-settings {
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+}
+
+/* The action row keeps real buttons - they are destinations, not transport - so
+ * they get a faint fill to read as targets against the blur. */
+#trayplay-settings,
+#trayplay-library,
+#trayplay-queue {
+  background-color: alpha(@card_bg_color, 0.4);
+  border: none;
+}
+
+/* Rows need their own faint fill or they vanish into the blur. */
+#trayplay-list > row {
+  background-color: alpha(@card_bg_color, 0.35);
+}
+
+#trayplay-list > row:hover {
+  background-color: alpha(@card_bg_color, 0.6);
+}
+
+#trayplay-section {
+  margin-top: 6px;
+  opacity: 0.7;
+}
+
+#trayplay-status {
+  font-size: 0.9em;
+  opacity: 0.7;
+}
+
+/* Row right-click menu. Buttons rather than a menu model (see attach_row_menu),
+ * so the menu-item look is CSS here rather than something GTK provides. */
+#trayplay-row-menu button {
+  padding: 6px 12px;
+  min-height: 0;
+  border-radius: 4px;
+}
+
+/* Playback errors are libadwaita toasts and keep its styling by default. The
+ * overlay is named only so a theme has a root to reach the banner through:
+ * `#trayplay-toast .toast { ... }`. */

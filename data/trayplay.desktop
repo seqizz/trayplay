@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=trayplay
+GenericName=Music Player
+Comment=Systray Jellyfin music player
+Exec=trayplay
+Icon=trayplay
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=jellyfin;music;player;tray;
+# The app has no window at startup - the tray icon is what appears - so a
+# launcher waiting for one would show a spinner until it gave up.
+StartupNotify=false
+# Must match glib::set_prgname in src/main.rs: it is what the AwesomeWM rule for
+# popup placement matches on, and what a desktop associates the process with.
+StartupWMClass=trayplay
+# Named in the MPRIS bus name (org.mpris.MediaPlayer2.trayplay) via
+# desktop_entry, so clients can find this file for the icon and name.
+X-MPRIS-DesktopEntry=trayplay
