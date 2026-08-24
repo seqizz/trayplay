@@ -222,6 +222,13 @@ ruled.client.append_rule {
 }
 ```
 
+Do not raise, unminimise or otherwise poke the window from the window manager side:
+running `trayplay` again is the supported way to reach a running instance. The second
+process hands off over D-Bus and the popup toggles exactly as a tray click does (show,
+raise if it is up but unfocused, hide if it has focus). Raising the client by hand tends
+to clear properties the rule above sets, and since the window is unmanaged on every hide,
+nothing restores them.
+
 Under Wayland none of this is needed: the tray is native SNI and the popup is a
 `gtk4-layer-shell` surface anchored per the `anchor` config key.
 

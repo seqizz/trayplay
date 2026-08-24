@@ -272,8 +272,17 @@ fn build(
     // exists even if hidden - `set_hide_on_close(true)` never destroys it),
     // so this is also where a relaunch has to actually show it, or running
     // the binary again would look like doing nothing.
-    if let Some(window) = app.windows().first() {
-        window.present();
+    //
+    // Routed through `UiRequest::TogglePopup` rather than presenting the window
+    // directly, so a relaunch means exactly what a tray click means: show when
+    // hidden, raise when it is up but unfocused, hide when it has focus. A bare
+    // `present()` could only ever show, which made re-running the binary a
+    // one-way door and forced whatever launched it (a wibar button, a
+    // keybinding) to implement hiding itself.
+    if !app.windows().is_empty() {
+        if let Err(err) = tray_ui.try_send(UiRequest::TogglePopup) {
+            tracing::warn!(%err, "cannot forward a relaunch to the popup");
+        }
         return Ok(());
     }
 
