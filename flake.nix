@@ -139,10 +139,10 @@
         # release works with nothing but a host change. An empty hash means no
         # prebuilt binary was published for that system.
         prebuiltPin = {
-          version = "0.1.0";
-          baseUrl = "https://REPLACE-ME.example.org/gurkan/trayplay/releases/download/v0.1.0";
+          version = "0.2.0";
+          baseUrl = "https://git.gurkan.in/gurkan/trayplay/releases/download/v0.2.0";
           hash = {
-            x86_64-linux = "";
+            x86_64-linux = "sha256-YfEDOvpfKm1iJjsp0Yglos0AGV2U1CNJr90zDxu4+AQ=";
           };
         };
 
