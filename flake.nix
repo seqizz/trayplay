@@ -126,23 +126,35 @@
               -czf $out -C ${trayplay} .
           '';
 
-        # Which release `.#prebuilt` installs.
+        # Where releases live. Forgejo uses the same shape as GitHub -
+        # <host>/<owner>/<repo>/releases/download/<tag> - so a mirror works with
+        # nothing but a host change, and the tag is derived from `version` above
+        # rather than written out again.
+        releaseBaseUrl = "https://git.gurkan.in/gurkan/trayplay/releases/download/v${version}";
+
+        # Artifact hashes for `.#prebuilt`, keyed by version and then system.
+        #
+        # Only the hash is pinned by hand: which release to install follows
+        # `Cargo.toml`, so a version bump points at its own release with no
+        # second edit. A hash cannot follow anything - Nix needs it at eval time
+        # to fetch at all, and asking a forge for "latest" would be network
+        # access during evaluation, which pure flake eval forbids. So bumping the
+        # version *before* its release exists leaves no entry here, and that is
+        # the honest outcome: `.#prebuilt` fails with the message below instead
+        # of fetching a tarball nobody has verified.
         #
         # Inline rather than a separate pin file on purpose: a new file has to be
         # `git add`ed before a flake can even see it (Nix copies tracked files
         # only), which is a confusing failure for something that looks like data.
-        # The release workflow prints a ready-made replacement for this block in
-        # the release notes, so updating it is a copy-paste and a commit.
-        #
-        # `baseUrl` is the release's asset directory. Forgejo uses the same shape
-        # as GitHub - <host>/<owner>/<repo>/releases/download/<tag> - so a mirror
-        # release works with nothing but a host change. An empty hash means no
-        # prebuilt binary was published for that system.
-        prebuiltPin = {
-          version = "0.2.0";
-          baseUrl = "https://git.gurkan.in/gurkan/trayplay/releases/download/v0.2.0";
-          hash = {
+        # The release workflow prints a ready-made entry in the release notes, so
+        # updating it is a copy-paste and a commit. Old entries can stay - they
+        # cost nothing and document what was released.
+        prebuiltHashes = {
+          "0.2.0" = {
             x86_64-linux = "sha256-YfEDOvpfKm1iJjsp0Yglos0AGV2U1CNJr90zDxu4+AQ=";
+          };
+          "0.2.1" = {
+            x86_64-linux = "sha256-TDPEOfrsuTZDT04ExwvhE7GMpm/ceK++4/mZ0MTQ80E=";
           };
         };
 
@@ -156,24 +168,26 @@
         # this with a "could not satisfy dependency" from autoPatchelf, and the
         # answer then is to build from source (`nix build .#trayplay`) until a new
         # release is cut. It is also NixOS-only: nothing here helps a Debian box.
-        pinnedHash = prebuiltPin.hash.${system} or "";
+        pinnedHash = prebuiltHashes.${version}.${system} or "";
 
-        # An absent or empty hash means no release was published for this system.
-        # Reported by a derivation that fails when *built* rather than by a throw
-        # while evaluating: a throw would make `nix flake check` fail on a flake
-        # that is perfectly fine, just not released yet.
+        # An absent or empty hash means this version was never released for this
+        # system. Reported by a derivation that fails when *built* rather than by
+        # a throw while evaluating: a throw would make `nix flake check` fail on a
+        # flake that is perfectly fine, just not released yet.
         prebuilt = if pinnedHash == "" then
           pkgs.runCommand "trayplay-bin-unavailable" { } ''
-            echo "No prebuilt trayplay for ${system}: nothing is pinned in flake.nix's" >&2
-            echo "prebuiltPin. Build from source instead:  nix build .#trayplay" >&2
+            echo "No prebuilt trayplay ${version} for ${system}: no hash for that" >&2
+            echo "version in flake.nix's prebuiltHashes - either it has not been" >&2
+            echo "released yet, or the entry is missing. Build from source" >&2
+            echo "instead:  nix build .#trayplay" >&2
             exit 1
           ''
         else pkgs.stdenv.mkDerivation {
           pname = "trayplay-bin";
-          version = prebuiltPin.version;
+          inherit version;
 
           src = pkgs.fetchurl {
-            url = "${prebuiltPin.baseUrl}/trayplay-${prebuiltPin.version}-${system}.tar.gz";
+            url = "${releaseBaseUrl}/trayplay-${version}-${system}.tar.gz";
             hash = pinnedHash;
           };
 

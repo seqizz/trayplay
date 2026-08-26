@@ -13,9 +13,9 @@
 #     The automatic `${{ github.token }}` may also work depending on the Forgejo
 #     version's default permissions, but an explicit token is predictable.
 #
-# The release body carries the ready-made `prebuiltPin` block for flake.nix. That
-# is not committed automatically: a tag build pushing to the branch it was cut
-# from is the kind of cleverness that goes wrong quietly, so updating the pin
+# The release body carries the ready-made `prebuiltHashes` entry for flake.nix.
+# That is not committed automatically: a tag build pushing to the branch it was
+# cut from is the kind of cleverness that goes wrong quietly, so updating the pin
 # stays a deliberate copy-paste.
 
 name: release
@@ -104,15 +104,13 @@ jobs:
           BODY=$(cat <<EOF
           Prebuilt for x86_64-linux, built by Nix from this tag.
 
-          Install it without compiling by pinning this release in \`flake.nix\`:
+          Install it without compiling by adding this entry to \`prebuiltHashes\` in
+          \`flake.nix\` (the version and URL follow \`Cargo.toml\`, so the hash is the
+          only thing to paste):
 
           \`\`\`nix
-          prebuiltPin = {
-            version = "$VERSION";
-            baseUrl = "$DOWNLOAD";
-            hash = {
-              x86_64-linux = "$HASH";
-            };
+          "$VERSION" = {
+            x86_64-linux = "$HASH";
           };
           \`\`\`
 
