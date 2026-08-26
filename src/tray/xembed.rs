@@ -133,7 +133,8 @@ impl IconSet {
 
 /// Left click toggles the popup, middle click play/pauses, scroll steps
 /// next/previous - the same actions `sni::Tray` gives under SNI. Right click
-/// is deliberately a no-op (see module docs; there is nowhere to put a menu).
+/// toggles too: there is no menu to put on it here (see module docs), so it
+/// behaves as a second left click rather than doing nothing.
 fn wire_input(id: TrayIconId, ui: async_channel::Sender<UiRequest>, player: Option<PlayerHandle>) {
     std::thread::spawn(move || {
         let receiver = TrayIconEvent::receiver();
@@ -162,7 +163,15 @@ fn wire_input(id: TrayIconId, ui: async_channel::Sender<UiRequest>, player: Opti
                         Some(player) => player.send(Command::PlayPause),
                         None => tracing::warn!("no player available, run `trayplay login`"),
                     },
-                    MouseButton::Right => {}
+                    // No menu to open here (see module docs), so the button is
+                    // a second left click rather than nothing: `TogglePopup`,
+                    // so a right click both raises and closes and the two
+                    // buttons never disagree about what the popup should do.
+                    MouseButton::Right => {
+                        if let Err(err) = ui.send_blocking(UiRequest::TogglePopup) {
+                            tracing::warn!(%err, "UI channel closed, dropping tray request");
+                        }
+                    }
                 },
                 // Vendored patch (vendor/tray/PATCH.md): upstream has no
                 // Scroll event on X11 at all, this is trayplay's own
@@ -170,9 +179,9 @@ fn wire_input(id: TrayIconId, ui: async_channel::Sender<UiRequest>, player: Opti
                 TrayIconEvent::Scroll { delta, .. } => match &player {
                     Some(player) => {
                         if delta < 0 {
-                            player.send(Command::Next);
-                        } else if delta > 0 {
                             player.send(Command::Previous);
+                        } else if delta > 0 {
+                            player.send(Command::Next);
                         }
                     }
                     None => tracing::warn!("no player available, run `trayplay login`"),

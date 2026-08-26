@@ -470,20 +470,43 @@ impl ListPage {
         item.album_artist.clone()
     }
 
-    /// Subtitle for a track row: track number and length.
+    /// Subtitle for a track row: credited artists, length. No track number -
+    /// rows are already listed in track order, so it only crowds the line.
+    ///
+    /// The artists are only shown when they differ from the album artist the
+    /// page is already headed by - a featuring credit or a compilation track is
+    /// exactly what the row cannot otherwise tell you, while repeating the same
+    /// name down every row of a single-artist album is noise.
     pub fn track_subtitle(item: &Item) -> Option<String> {
-        let length = item.duration().map(|d| format_time(d.as_secs_f64()));
-        match (item.index_number, length) {
-            (Some(n), Some(len)) => Some(format!("{n}. {len}")),
-            (Some(n), None) => Some(format!("{n}.")),
-            (None, Some(len)) => Some(len),
-            (None, None) => None,
+        let credited = item.display_artists();
+        let artists = match item.album_artist.as_deref() {
+            Some(album_artist) if album_artist == credited => None,
+            _ => Some(credited),
+        };
+
+        let mut parts = Vec::new();
+        if let Some(artists) = artists {
+            parts.push(artists);
         }
+        if let Some(length) = item.duration().map(|d| format_time(d.as_secs_f64())) {
+            parts.push(length);
+        }
+
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
     /// Subtitle for a standalone track, which has no album to sit under.
+    ///
+    /// The page is one artist's, so a single credit says nothing new; more than
+    /// one does, since the co-credits are not on the row anywhere else.
     pub fn loose_track_subtitle(item: &Item) -> Option<String> {
-        item.duration().map(|d| format_time(d.as_secs_f64()))
+        let length = item.duration().map(|d| format_time(d.as_secs_f64()));
+        let collaboration = item.artist_items.len() > 1 || item.artists.len() > 1;
+        match (collaboration, length) {
+            (true, Some(len)) => Some(format!("{} · {len}", item.display_artists())),
+            (true, None) => Some(item.display_artists()),
+            (false, len) => len,
+        }
     }
 
     /// Subtitle for a Library search hit: results mix artists, albums and
@@ -493,10 +516,12 @@ impl ListPage {
             Kind::Artist => Some("Artist".to_string()),
             Kind::Album => Some(item.album_artist.clone().unwrap_or_else(|| "Album".to_string())),
             Kind::Track => {
-                let artist = item.display_artist();
+                // Every credited artist, not the album artist: a search hit has
+                // no page around it to say who is on the track.
+                let artists = item.display_artists();
                 match item.album.as_deref() {
-                    Some(album) if !album.is_empty() => Some(format!("{artist} · {album}")),
-                    _ => Some(artist.to_string()),
+                    Some(album) if !album.is_empty() => Some(format!("{artists} · {album}")),
+                    _ => Some(artists),
                 }
             }
             Kind::Other => None,

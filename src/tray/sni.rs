@@ -80,16 +80,17 @@ impl ksni::Tray for Tray {
     /// Vertical scroll steps through the queue.
     ///
     /// The sign of `delta` is not fixed by the spec and depends on the host, so
-    /// this follows the GTK convention of negative meaning "up". Swap the arms
-    /// if your tray scrolls the other way.
+    /// this follows the GTK convention of negative meaning "up": scrolling down
+    /// goes to the next track, matching the XEmbed backend. Swap the arms if
+    /// your tray scrolls the other way.
     fn scroll(&mut self, delta: i32, orientation: Orientation) {
         if orientation != Orientation::Vertical || delta == 0 {
             return;
         }
         if delta < 0 {
-            self.command(Command::Next);
-        } else {
             self.command(Command::Previous);
+        } else {
+            self.command(Command::Next);
         }
     }
 
