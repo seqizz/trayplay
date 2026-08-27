@@ -232,6 +232,31 @@
   animation-iteration-count: infinite;
 }
 
+/* A track being loaded: the download or transcode has been asked for and nothing
+ * is playing yet. Overlaid on the seek bar (see src/ui/nowplaying.rs), sitting on
+ * its bottom edge, thinner than the trough and translucent - it reports, it does
+ * not ask for attention, and it must not read as playback progress.
+ *
+ * GtkProgressBar's node tree is `progressbar > trough > progress`, so both parts
+ * need their own rule; the widget's own `min-height` is what would otherwise
+ * reserve room for a text label it does not have. */
+#trayplay-loading {
+  min-height: 3px;
+}
+
+#trayplay-loading trough {
+  min-height: 3px;
+  background-color: transparent;
+  border-width: 0;
+}
+
+#trayplay-loading progress {
+  min-height: 3px;
+  border-radius: 2px;
+  background-color: alpha(@window_fg_color, 0.5);
+  background-image: none;
+}
+
 /* Full opacity plus a shadow instead of dimming: dimmed text over a blurred
  * backdrop stops being readable. */
 .trayplay-artist,

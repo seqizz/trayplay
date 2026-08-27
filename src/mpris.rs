@@ -234,6 +234,10 @@ async fn run(
                 }
             }
             Ok(Event::Failed(_)) => {}
+            // MPRIS has no notion of buffering: a client sees the old track
+            // until the new one actually starts, which is when `TrackChanged`
+            // republishes the metadata.
+            Ok(Event::Loading(_)) | Ok(Event::Buffering { .. }) => {}
             Err(RecvError::Lagged(n)) => tracing::debug!(skipped = n, "MPRIS fell behind"),
             Err(RecvError::Closed) => break,
         }

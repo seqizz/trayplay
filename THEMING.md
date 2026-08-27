@@ -25,6 +25,7 @@ Selectors are a stability contract — renames are treated as breaking changes.
 | `#trayplay-album` | album button (navigates to the album) |
 | `#trayplay-seek` | seek slider. Style the parts through its GTK nodes: `trough` (track), `trough highlight` (played portion), `slider` (handle — sized to nothing at rest, a translucent block on `:hover`/`:active`) |
 | `#trayplay-seek.seeking` | set while a seek is issued but not yet in effect; pulses `trough highlight` |
+| `#trayplay-loading` | thin bar overlaid on the bottom edge of the seek slider while a track is being loaded (download, or a server-side transcode). Style through its GTK nodes: `trough` and `progress`. Hidden entirely for a load shorter than the grace period, and it *pulses* rather than filling when the server sends no `Content-Length` — the timings are constants in `src/ui/nowplaying.rs` and are not themable |
 | `#trayplay-seek value` | elapsed time, drawn above the handle. Always present so its height never shifts the layout; `#trayplay-seek.showing-value` is what makes it visible, on hover. There are no permanent elapsed/total labels |
 | `#trayplay-transport` | centre box holding the transport buttons, with repeat at its left end and shuffle at its right |
 | `.trayplay-glyph` | transport controls, drawn as bare glyphs — the rule that strips the button shape in every state. Adwaita's `.flat` is not enough, it still paints a hover background |

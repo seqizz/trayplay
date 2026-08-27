@@ -140,6 +140,32 @@ pub enum Event {
     /// need it: the button paints the new state, MPRIS republishes LoopStatus.
     RepeatChanged(Repeat),
     StateChanged(State),
+    /// A track is being opened: the request has gone out and nothing is playing
+    /// yet.
+    ///
+    /// Emitted *before* the await that opens the stream, which is the whole
+    /// point - the actor is single-threaded, so while a track is loading it
+    /// cannot even answer a `Snapshot`, and a slow server or a real-time
+    /// transcode is otherwise indistinguishable from a Next press that was
+    /// dropped. `None` means something is being fetched whose track is not known
+    /// yet (a random queue being filled).
+    ///
+    /// There is no explicit "done": `TrackChanged` and `Failed` are the two ways
+    /// a load ends, and both are already emitted.
+    Loading(Option<Item>),
+    /// Download progress for one cache entry, throttled to a handful of events
+    /// per track.
+    ///
+    /// Sent by the download task rather than by the actor, so it keeps arriving
+    /// while the actor is blocked waiting for exactly this. `id` is the item id,
+    /// because prefetches report too and only the track being waited for should
+    /// be shown. `total` is None when the response carried no Content-Length -
+    /// a transcode - in which case there is no fraction to draw.
+    Buffering {
+        id: String,
+        got: u64,
+        total: Option<u64>,
+    },
     Position(Duration),
     /// A seek was performed. MPRIS clients need this to resync their own
     /// position estimate rather than waiting for the next poll.
@@ -234,6 +260,11 @@ impl Player {
             warming: None,
             events: events.clone(),
         };
+
+        // The cache reports download progress on the same channel. It is given
+        // the sender here rather than at construction because the channel is
+        // created with the actor, and main builds the cache before it.
+        player.cache.set_events(events.clone());
 
         tokio::spawn(player.run(rx));
         PlayerHandle { tx, events }
@@ -585,6 +616,8 @@ impl Player {
     /// A separate method rather than recursing into handle(): a recursive async
     /// fn would need boxing, and this reads better anyway.
     async fn play_random(&mut self) -> Result<()> {
+        // No track to name yet, but the query itself can be the slow part.
+        self.emit(Event::Loading(None));
         let tracks = self
             .client
             .random_tracks(self.random_batch)
@@ -669,6 +702,13 @@ impl Player {
 
     /// Moves to the next track, refilling a random queue if it is running out.
     async fn advance(&mut self) -> Result<()> {
+        // Before the refill, not after: a random queue tops itself up over the
+        // network here, so this is one of the places a Next press can sit for a
+        // while with nothing to show for it. `start_current` announces the same
+        // track again once the cursor has actually moved.
+        self.emit(Event::Loading(
+            self.queue.peek_next(self.repeat == Repeat::All).cloned(),
+        ));
         self.maybe_refill().await;
 
         if self.queue.advance(self.repeat == Repeat::All).is_some() {
@@ -694,6 +734,11 @@ impl Player {
                 self.set_state(State::Stopped);
                 return Ok(());
             };
+
+            // Announced before the open, which is the await that can take
+            // seconds: nothing else in the process can tell the UI that a track
+            // is on its way, since this actor is busy for the whole of it.
+            self.emit(Event::Loading(Some(item.clone())));
 
             let reader = match self.open(&item).await {
                 Ok(reader) => reader,

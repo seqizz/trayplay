@@ -3,11 +3,22 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::broadcast;
+
+use super::Event;
+
+/// Smallest gap between two `Event::Buffering` reports for one download.
+///
+/// A chunk is a few kilobytes, so reporting each one would fill the broadcast
+/// ring several times per track for an indicator that cannot show that detail
+/// anyway. With a known length the step is a fiftieth of the file instead, so a
+/// long track still reports about fifty times.
+const REPORT_STEP: u64 = 256 * 1024;
 
 /// The server has no file for this item any more: a 404 on the stream URL.
 ///
@@ -46,6 +57,10 @@ pub struct Cache {
     /// Downloads currently running, so a prefetch and a play of the same track
     /// share one HTTP request instead of racing each other.
     inflight: Mutex<HashMap<String, Inflight>>,
+    /// Where download progress is published, once the player has a channel to
+    /// publish it on. Set once, from `Player::spawn`; absent before that and in
+    /// the CLI, where nothing is listening.
+    events: OnceLock<broadcast::Sender<Event>>,
 }
 
 /// What a joining reader needs to know about a download already in progress.
@@ -128,7 +143,16 @@ impl Cache {
             http,
             max_bytes: AtomicU64::new(max_bytes),
             inflight: Mutex::new(HashMap::new()),
+            events: OnceLock::new(),
         })
+    }
+
+    /// Gives the cache somewhere to report download progress.
+    ///
+    /// Called by the player, which owns the event channel. A second call is
+    /// ignored: there is one player per process.
+    pub fn set_events(&self, events: broadcast::Sender<Event>) {
+        let _ = self.events.set(events);
     }
 
     /// Changes the ceiling. The caller prunes if it wants the new one applied
@@ -386,8 +410,14 @@ impl Cache {
         let this = self.clone();
         let key_owned = key.to_string();
         let progress_task = progress.clone();
+        let report = Report {
+            events: self.events.get().cloned(),
+            id: key.to_string(),
+            total,
+            next: 0,
+        };
         tokio::spawn(async move {
-            let result = download(resp, writer, &progress_task).await;
+            let result = download(resp, writer, &progress_task, report).await;
             match result {
                 Ok(()) => match fs::rename(&part_path, &final_path) {
                     Ok(()) => {
@@ -466,7 +496,49 @@ impl Cache {
     }
 }
 
-async fn download(resp: reqwest::Response, writer: File, progress: &Progress) -> Result<()> {
+/// Throttled progress reporting for one download.
+///
+/// Lives in the download task rather than in the player: the actor is blocked
+/// awaiting the very download this describes, so it could not forward anything.
+struct Report {
+    /// None in the CLI, and before the player has been spawned.
+    events: Option<broadcast::Sender<Event>>,
+    id: String,
+    total: Option<u64>,
+    /// Byte count the next report is due at.
+    next: u64,
+}
+
+impl Report {
+    fn publish(&mut self, got: u64) {
+        let Some(events) = &self.events else { return };
+        if got < self.next {
+            return;
+        }
+        // A fiftieth of a known length, so the report rate does not depend on
+        // the size of the file; a fixed step when the length is unknown, which
+        // is the transcoded case where there is no fraction to draw anyway.
+        let step = match self.total {
+            Some(total) => (total / 50).max(REPORT_STEP),
+            None => REPORT_STEP,
+        };
+        self.next = got + step;
+        // No subscribers is normal, and a full ring means the UI is behind on
+        // an indicator - neither is worth reporting.
+        let _ = events.send(Event::Buffering {
+            id: self.id.clone(),
+            got,
+            total: self.total,
+        });
+    }
+}
+
+async fn download(
+    resp: reqwest::Response,
+    writer: File,
+    progress: &Progress,
+    mut report: Report,
+) -> Result<()> {
     use anyhow::bail;
 
     let mut file = tokio::fs::File::from_std(writer);
@@ -484,6 +556,7 @@ async fn download(resp: reqwest::Response, writer: File, progress: &Progress) ->
 
         written += chunk.len() as u64;
         progress.publish(written);
+        report.publish(written);
     }
 
     // A 200 with no body would otherwise be renamed into place and cached as a

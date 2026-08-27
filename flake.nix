@@ -126,6 +126,154 @@
               -czf $out -C ${trayplay} .
           '';
 
+        # `nix run .#bump -- patch|minor|major|X.Y.Z`
+        #
+        # `Cargo.toml`'s version is the single source of truth for the tag, the
+        # artifact name, the prebuilt URL and `trayplay --version`, and the lock
+        # file records it a second time - so bumping by hand is two edits that
+        # have to agree, plus a commit and a tag named after them. This does that
+        # one way every time.
+        #
+        # It stops at the files by default: committing and tagging are opt-in
+        # (`--commit`, `--tag`), because a bump is also how one tries a version
+        # number out. Nothing here pushes, and nothing here touches
+        # `prebuiltHashes` - that hash cannot exist until the artifact does.
+        bump = pkgs.writeShellApplication {
+          name = "trayplay-bump";
+          # cargo is what rewrites Cargo.lock; letting it do that is safer than
+          # sed on a file whose format is cargo's business.
+          runtimeInputs = [ pkgs.git toolchain ];
+          text = ''
+            usage() {
+              cat >&2 <<'EOF'
+            usage: trayplay-bump [patch|minor|major|X.Y.Z] [--commit] [--tag]
+
+              patch (default)  0.2.1 -> 0.2.2
+              minor            0.2.1 -> 0.3.0
+              major            0.2.1 -> 1.0.0
+              X.Y.Z            set it outright
+
+              --commit   commit Cargo.toml and Cargo.lock, and nothing else
+              --tag      also create the annotated tag vX.Y.Z (implies --commit)
+            EOF
+              exit 2
+            }
+
+            # Quoted: bare `patch` is also a command, which shellcheck objects to.
+            what="patch"
+            commit=0
+            tag=0
+            for arg in "$@"; do
+              case "$arg" in
+                patch|minor|major) what="$arg" ;;
+                --commit) commit=1 ;;
+                # A tag has to point at the commit that carries the version, so
+                # there is no useful meaning for --tag on its own.
+                --tag) tag=1; commit=1 ;;
+                -h|--help) usage ;;
+                *.*.*) what="$arg" ;;
+                *) echo "unrecognised argument: $arg" >&2; usage ;;
+              esac
+            done
+
+            root=$(git rev-parse --show-toplevel)
+            cd "$root"
+
+            # Only the [package] section: a dependency line saying `version =`
+            # must not be caught by this.
+            current=$(sed -n '/^\[package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -1)
+            if [ -z "$current" ]; then
+              echo "cannot find the package version in Cargo.toml" >&2
+              exit 1
+            fi
+
+            case "$what" in
+              patch|minor|major)
+                IFS=. read -r major minor patch <<<"$current"
+                case "$major$minor$patch" in
+                  *[!0-9]*|"")
+                    echo "current version $current is not X.Y.Z; pass one explicitly" >&2
+                    exit 1
+                    ;;
+                esac
+                case "$what" in
+                  patch) patch=$((patch + 1)) ;;
+                  minor) minor=$((minor + 1)); patch=0 ;;
+                  major) major=$((major + 1)); minor=0; patch=0 ;;
+                esac
+                next="$major.$minor.$patch"
+                ;;
+              *)
+                next="$what"
+                case "$next" in
+                  *[!0-9.]*|*..*|.*|*.)
+                    echo "not a version: $next" >&2
+                    exit 1
+                    ;;
+                esac
+                ;;
+            esac
+
+            if [ "$next" = "$current" ]; then
+              echo "already at $current" >&2
+              exit 1
+            fi
+
+            # Path-limited, because the working tree is usually mid-change and
+            # the commit below is deliberately only these two files. Edits
+            # already sitting in them would be swept into it.
+            if [ "$commit" = 1 ] && ! git diff --quiet HEAD -- Cargo.toml Cargo.lock; then
+              echo "Cargo.toml or Cargo.lock already has uncommitted changes;" >&2
+              echo "commit or stash them first, or bump without --commit." >&2
+              exit 1
+            fi
+            if [ "$tag" = 1 ] && git rev-parse -q --verify "refs/tags/v$next" >/dev/null; then
+              echo "tag v$next already exists" >&2
+              exit 1
+            fi
+
+            awk -v v="$next" '
+              /^\[/ { section = $0 }
+              section == "[package]" && !done && /^version *=/ {
+                print "version = \"" v "\""
+                done = 1
+                next
+              }
+              { print }
+              END { if (!done) exit 1 }
+            ' Cargo.toml > Cargo.toml.bump || {
+              echo "no version line inside [package]" >&2
+              rm -f Cargo.toml.bump
+              exit 1
+            }
+            mv Cargo.toml.bump Cargo.toml
+
+            # Offline on purpose: this machine has no crates.io access, and the
+            # only thing that needs to change is this package's own entry.
+            cargo update --offline --quiet -p trayplay
+
+            echo "$current -> $next"
+
+            if [ "$commit" = 1 ]; then
+              git commit --quiet -m "Version $next" -- Cargo.toml Cargo.lock
+              echo "committed"
+            fi
+            if [ "$tag" = 1 ]; then
+              git tag -a "v$next" -m "trayplay $next"
+              echo "tagged v$next"
+            fi
+
+            cat <<EOF
+
+            Next, for a release:
+              git push && git push origin v$next   # if you tagged
+              nix build .#releaseTarball           # what the workflow builds
+              nix hash file --type sha256 --sri result
+            then paste the hash into prebuiltHashes in flake.nix under "$next".
+            EOF
+          '';
+        };
+
         # Where releases live. Forgejo uses the same shape as GitHub -
         # <host>/<owner>/<repo>/releases/download/<tag> - so a mirror works with
         # nothing but a host change, and the tag is derived from `version` above
@@ -155,6 +303,9 @@
           };
           "0.2.1" = {
             x86_64-linux = "sha256-TDPEOfrsuTZDT04ExwvhE7GMpm/ceK++4/mZ0MTQ80E=";
+          };
+          "0.3.0" = {
+            x86_64-linux = "sha256-R+Hr+d0mjre1w7eKtYvTZ+0L5HJBaDWFACKvJTT1Z9s=";
           };
         };
 
@@ -222,10 +373,18 @@
       {
         packages = {
           default = trayplay;
-          inherit trayplay prebuilt releaseTarball;
+          inherit trayplay prebuilt releaseTarball bump;
         };
 
-        apps.default = flake-utils.lib.mkApp { drv = trayplay; };
+        apps = {
+          default = flake-utils.lib.mkApp { drv = trayplay; };
+          # `nix run .#bump -- minor --tag`. exePath spelled out because the
+          # derivation name is not the flake attribute name.
+          bump = flake-utils.lib.mkApp {
+            drv = bump;
+            exePath = "/bin/trayplay-bump";
+          };
+        };
 
         # craneLib.devShell builds nativeBuildInputs itself from the toolchain and
         # `packages`, so build tools must go in `packages` or their setup hooks

@@ -3195,7 +3195,7 @@ dependencies = [
 
 [[package]]
 name = "trayplay"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-channel",

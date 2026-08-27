@@ -45,6 +45,26 @@ const TAG_FADE_FROM: f64 = 0.35;
 /// so the pin needs an expiry, not only a confirmation.
 const SEEK_PIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a track may be loading before anything is shown for it.
+///
+/// A cached track opens in a millisecond or two, and most do: without a grace
+/// period the indicator would flash on every single Next press and read as a
+/// glitch rather than as information.
+const LOAD_GRACE: Duration = Duration::from_millis(350);
+
+/// How often the loading bar pulses while the download length is unknown - a
+/// server-side transcode sends no Content-Length, so there is no fraction to
+/// draw and the bar can only say "still working".
+const LOAD_PULSE: Duration = Duration::from_millis(120);
+
+/// How long a load may run before it is worth interrupting for.
+///
+/// The bar is deliberately quiet, which is right for the two-second case and
+/// wrong for the one where the server has stopped answering. This is the point
+/// where a hidden popup should have left something behind in the log and a
+/// visible one should say so in words.
+const LOAD_NAG: Duration = Duration::from_secs(8);
+
 /// Transport glyph size in pixels. Larger than the 16px icon-theme default
 /// because the glyphs carry no button shape, so nothing else gives them
 /// presence.
@@ -90,6 +110,18 @@ pub struct NowPlaying {
     /// Held so the fade is not dropped mid-flight, which cancels it.
     tag_fade: RefCell<Option<adw::TimedAnimation>>,
     seek: gtk::Scale,
+    /// Download progress for the track being loaded, overlaid on the seek bar so
+    /// showing it never reflows the popup.
+    loading: gtk::ProgressBar,
+    /// Item id being waited for. `Event::Buffering` also reports prefetches, and
+    /// only the track the user is waiting for should be drawn.
+    load_id: Rc<RefCell<Option<String>>>,
+    /// Bumped per load, so the grace timer, the pulse and the nag from an
+    /// earlier one all become no-ops without anything to cancel.
+    load_generation: Rc<Cell<u64>>,
+    /// True once real byte counts have arrived, which stops the pulse: the two
+    /// cannot both drive the same bar.
+    load_determinate: Rc<Cell<bool>>,
     play_button: gtk::Button,
     /// The play button's image, so the icon can be swapped without rebuilding
     /// the child and losing its pixel size.
@@ -185,6 +217,16 @@ impl NowPlaying {
         });
         seek.add_controller(hover);
 
+        // Sits on the seek bar rather than in the box next to it: appearing and
+        // disappearing must not move the transport row, and the bar is where a
+        // user already looks for playback progress.
+        let loading = gtk::ProgressBar::builder()
+            .visible(false)
+            .valign(gtk::Align::End)
+            .can_target(false)
+            .build();
+        loading.set_widget_name("trayplay-loading");
+
         let prev = icon_button("trayplay-prev-symbolic", "trayplay-prev", GLYPH_SIZE);
         // The image is kept: set_state swaps the icon on it. Calling
         // Button::set_icon_name instead would replace the child with a fresh
@@ -277,7 +319,11 @@ impl NowPlaying {
         tags.append(&album);
 
         content.append(&tags);
-        content.append(&seek);
+
+        let seek_area = gtk::Overlay::new();
+        seek_area.set_child(Some(&seek));
+        seek_area.add_overlay(&loading);
+        content.append(&seek_area);
         content.append(&transport);
         content.append(&actions);
 
@@ -300,6 +346,10 @@ impl NowPlaying {
             tags,
             tag_fade: RefCell::new(None),
             seek,
+            loading,
+            load_id: Rc::new(RefCell::new(None)),
+            load_generation: Rc::new(Cell::new(0)),
+            load_determinate: Rc::new(Cell::new(false)),
             play_button,
             play_icon,
             repeat_icon,
@@ -544,7 +594,110 @@ impl NowPlaying {
         });
     }
 
+    /// A track is on its way. Nothing is shown for `LOAD_GRACE`, so a cached
+    /// track - the common case - passes through invisibly.
+    ///
+    /// `None` is a load whose track is not known yet (a random queue being
+    /// fetched): the bar still appears, it just cannot name anything if it has
+    /// to nag.
+    pub fn set_loading(self: &Rc<Self>, item: Option<Item>) {
+        let id = item.as_ref().map(|item| item.id.clone());
+        // The same track is announced twice for a Next - once before the queue
+        // refill, once when the cursor reaches it - and restarting the grace
+        // period there would blink the bar back off mid-load.
+        if id.is_some() && *self.load_id.borrow() == id {
+            return;
+        }
+
+        let generation = self.load_generation.get().wrapping_add(1);
+        self.load_generation.set(generation);
+        *self.load_id.borrow_mut() = id;
+        self.load_determinate.set(false);
+        self.loading.set_fraction(0.0);
+        self.loading.set_visible(false);
+
+        let name = item.map(|item| item.name);
+        let this = Rc::downgrade(self);
+        glib::timeout_add_local_once(LOAD_GRACE, move || {
+            let Some(this) = this.upgrade() else { return };
+            if this.load_generation.get() != generation {
+                return;
+            }
+            this.loading.set_visible(true);
+            this.pulse_loading(generation);
+            this.nag_loading(generation, name);
+        });
+    }
+
+    /// Drives the bar while the download length is unknown. Stops as soon as
+    /// real byte counts arrive, or the load ends.
+    fn pulse_loading(self: &Rc<Self>, generation: u64) {
+        let this = Rc::downgrade(self);
+        glib::timeout_add_local(LOAD_PULSE, move || {
+            let Some(this) = this.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if this.load_generation.get() != generation || this.load_determinate.get() {
+                return glib::ControlFlow::Break;
+            }
+            this.loading.pulse();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Says it in words once a load has gone on long enough to look broken.
+    ///
+    /// A toast rather than something on the bar: the popup is usually hidden, so
+    /// this is also what puts the wait in the log.
+    fn nag_loading(self: &Rc<Self>, generation: u64, name: Option<String>) {
+        let this = Rc::downgrade(self);
+        glib::timeout_add_local_once(LOAD_NAG, move || {
+            let Some(this) = this.upgrade() else { return };
+            if this.load_generation.get() != generation {
+                return;
+            }
+            let message = match &name {
+                Some(name) => format!("Still waiting for “{name}”"),
+                None => "Still waiting for the server".to_string(),
+            };
+            tracing::warn!(message, "track load is taking a long time");
+            super::popup::toast_info(message);
+        });
+    }
+
+    /// Download progress for one cache entry.
+    ///
+    /// Ignored unless it describes the track being waited for: prefetches report
+    /// on the same channel, and drawing one would show a bar racing ahead of a
+    /// track that has not started.
+    pub fn set_buffering(&self, id: &str, got: u64, total: Option<u64>) {
+        if self.load_id.borrow().as_deref() != Some(id) {
+            return;
+        }
+        // No Content-Length: the pulse stays in charge, since a fraction cannot
+        // be computed at all.
+        let Some(total) = total.filter(|total| *total > 0) else {
+            return;
+        };
+        self.load_determinate.set(true);
+        self.loading
+            .set_fraction((got as f64 / total as f64).clamp(0.0, 1.0));
+    }
+
+    /// Ends the current load, whichever way it went. Both outcomes reach this:
+    /// the track starting (`TrackChanged`) and the load failing (`Failed`).
+    pub fn clear_loading(&self) {
+        self.load_generation
+            .set(self.load_generation.get().wrapping_add(1));
+        *self.load_id.borrow_mut() = None;
+        self.load_determinate.set(false);
+        self.loading.set_visible(false);
+        self.loading.set_fraction(0.0);
+    }
+
     pub fn set_track(self: &Rc<Self>, item: Option<Item>) {
+        // Whatever was loading has either arrived or been given up on.
+        self.clear_loading();
         // A track change outranks any seek still in flight on the old one.
         self.release_pin();
         // The artist buttons are about to be rebuilt, so any focus among them is

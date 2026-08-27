@@ -868,7 +868,9 @@ fn push_tracks(nav: &adw::NavigationView, session: &Session, album_id: &str, alb
 /// Enqueueing needs one: it deliberately changes nothing on screen (no playback,
 /// no navigation), so without a word from the app a working "Play next" and a
 /// broken one look identical.
-fn toast_info(message: String) {
+/// Also used by `NowPlaying` for a load that is taking too long, which is
+/// reported from the same thread-local toaster as everything else here.
+pub(super) fn toast_info(message: String) {
     let toaster = TOASTER.with(|slot| slot.borrow().clone());
     if let Some(toaster) = toaster {
         toaster.show(message);
@@ -985,9 +987,16 @@ fn spawn_event_loop(
                 Event::QueueChanged => {}
                 Event::RepeatChanged(repeat) => now_playing.set_repeat(repeat),
                 Event::StateChanged(state) => now_playing.set_state(state),
+                Event::Loading(item) => now_playing.set_loading(item),
+                Event::Buffering { id, got, total } => {
+                    now_playing.set_buffering(&id, got, total)
+                }
                 Event::Position(pos) => now_playing.set_position(pos),
                 Event::Seeked(pos) => now_playing.set_seeked(pos),
                 Event::Failed(message) => {
+                    // The load this reports (if it was one) is over, so the bar
+                    // must not be left running behind the toast.
+                    now_playing.clear_loading();
                     // A refused seek ("this track cannot be seeked") never
                     // confirms, so release the slider here rather than leaving
                     // it pinned until the timeout.
