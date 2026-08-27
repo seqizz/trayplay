@@ -23,7 +23,7 @@ Not in scope:
 - A Jellyfin server, and an account on it, duh.
 - GTK4 and libadwaita. On NixOS the flake handles this; elsewhere you need the
   GTK4, libadwaita, `gtk4-layer-shell` and ALSA development packages.
-- For the popup to be *placed* on X11, a window manager rule — see
+- For the popup to be *placed* on X11, a window manager rule: see
   [Running under X11](#running-under-x11).
 - Optional: a compositor with blur, if you want the translucent look to blur what
   is behind it.
@@ -125,8 +125,8 @@ playerctl -p trayplay play-pause / next / previous / position 30
 playerctl -p trayplay loop Track|Playlist|None
 ```
 
-Transport, metadata and `LoopStatus`. `Volume` is absent — the system mixer owns
-volume, and so is `Shuffle`: random play here is a way of *building* a queue rather
+Transport, metadata and `LoopStatus`. `Volume` is absent (the system mixer owns
+volume), and so is `Shuffle`: random play here is a way of *building* a queue rather
 than a switch on an existing one, so there would be nothing to toggle. `LoopStatus`
 is the same setting as the repeat button (`Playlist` = repeat the queue, `Track` =
 repeat this track), so changing either updates the other. `Raise` shows the popup,
@@ -152,10 +152,10 @@ prefetch_next      = true
 ```
 
 `anchor` and `margin` only take effect under Wayland/layer-shell. On X11 the window
-manager decides placement — see below.
+manager decides placement (see below).
 
-`x11_window_type` sets `_NET_WM_WINDOW_TYPE` on the popup — the EWMH name without its
-`_NET_WM_WINDOW_TYPE_` prefix. It defaults to **`utility`**, which is what this window is
+`x11_window_type` sets `_NET_WM_WINDOW_TYPE` on the popup (the EWMH name without its
+`_NET_WM_WINDOW_TYPE_` prefix). It defaults to **`utility`**, which is what this window is
 by EWMH's own definition (a persistent auxiliary window, not a document window), and it
 keeps window manager and compositor rules written for ordinary windows from applying to
 it. GTK4 removed `set_type_hint` with no replacement, so trayplay sets the property itself,
@@ -164,8 +164,8 @@ before the window is first mapped. Set `"normal"` for GTK's own behaviour.
 `hide_delay_ms` is a trade rather than an improvement, which is why it defaults to 0
 (hide on the next main-loop turn). A delay swallows focus that bounces straight back,
 but whatever the window manager and compositor do with a window that is about to
-disappear — restacking it, fading it, re-redirecting the screen around a fullscreen
-window — then happens in plain sight for that long. If the popup looks like it flashes
+disappear (restacking it, fading it, re-redirecting the screen around a fullscreen
+window) then happens in plain sight for that long. If the popup looks like it flashes
 or jumps as it hides, that is the compositor, not the delay: with picom, try
 `unredir-if-possible = false` or `fade-exclude = [ "class_g = 'trayplay'" ]`.
 
@@ -200,7 +200,7 @@ download; entries go oldest-download-first. 500 MB by default.
 
 ## Running under X11
 
-The tray icon docks natively — no bridge process — but GTK4 removed window
+The tray icon docks natively, no bridge process but GTK4 removed window
 positioning on X11, so the window manager places the popup. trayplay sets a stable
 `WM_CLASS` of `trayplay` to match on. For AwesomeWM:
 
@@ -258,7 +258,7 @@ decoder cannot handle, and a container name cannot tell Opus from Vorbis.
 
 Transport and action icons come from [ionicons](https://github.com/ionic-team/ionicons),
 [Phosphor](https://github.com/phosphor-icons/core) and
-[Qlementine](https://github.com/oclero/qlementine-icons) — all MIT — plus one MynaUI
+[Qlementine](https://github.com/oclero/qlementine-icons) (all MIT) plus one MynaUI
 icon. They live in `data/icons/scalable/actions/`, renamed to `trayplay-*-symbolic`
 so they neither shadow icon theme names nor lose GTK's symbolic recolouring; each set
 keeps its own `LICENSE` and a `SOURCES.md` mapping every file to its upstream name.
