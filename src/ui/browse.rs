@@ -199,7 +199,9 @@ impl ListPage {
         menu: Vec<RowAction>,
         scroll_to: usize,
     ) -> (adw::NavigationPage, LiveList) {
-        let (page, sections, title_widget) = Self::build_inner(
+        let page = blank_page(title);
+        let (sections, title_widget) = Self::fill_inner(
+            &page,
             title,
             kind,
             vec![Section::new(items, subtitle_of, on_activate).with_menu(menu)],
@@ -222,32 +224,61 @@ impl ListPage {
         )
     }
 
-    /// Multi-section page with type-to-filter.
+    /// An empty page for a query that has not landed yet, filled in later by
+    /// [`ListPage::fill_sections`] with a multi-section, type-to-filter list.
     ///
     /// `kind` labels what the rows are ("Albums", "Tracks"), so a page reached
-    /// by clicking an artist or album name says plainly what it is listing.
-    pub fn build_sections(
+    /// by clicking an artist or album name says plainly what it is listing
+    /// before it has anything to list.
+    ///
+    /// Navigation pushes [`ListPage::pending`] the moment a row is activated and
+    /// calls [`ListPage::fill_sections`] when the result arrives, rather than
+    /// querying first and pushing afterwards. Querying first gave no feedback at
+    /// all for as long as the request took - up to the client's 30s timeout - and
+    /// left the activated row live underneath, so a second activation started a
+    /// second query and the two pages landed in whatever order the responses did.
+    /// Pushing first also covers those rows, which is what makes the second
+    /// activation impossible rather than merely unlikely.
+    pub fn pending(title: &str, kind: &str) -> adw::NavigationPage {
+        let page = blank_page(title);
+
+        let spinner = gtk::Spinner::new();
+        spinner.start();
+        spinner.set_size_request(32, 32);
+        spinner.set_halign(gtk::Align::Center);
+        spinner.set_valign(gtk::Align::Center);
+        spinner.set_vexpand(true);
+        spinner.set_widget_name("trayplay-loading");
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&page_header(title, kind, None).0);
+        toolbar.set_content(Some(&spinner));
+        page.set_child(Some(&toolbar));
+
+        page
+    }
+
+    /// Replaces a pending page's spinner with the list it was waiting for.
+    pub fn fill_sections(
+        page: &adw::NavigationPage,
         title: &str,
         kind: &str,
         sections: Vec<Section>,
         header_action: HeaderAction,
-    ) -> adw::NavigationPage {
-        Self::build_inner(title, kind, sections, header_action, None).0
+    ) {
+        Self::fill_inner(page, title, kind, sections, header_action, None);
     }
 
-    /// The section handles and the header's title widget come back alongside the
-    /// page so `build_live` can keep them; every other caller drops them.
-    fn build_inner(
+    /// The section handles and the header's title widget come back so
+    /// `build_live` can keep them; every other caller drops them.
+    fn fill_inner(
+        page: &adw::NavigationPage,
         title: &str,
         kind: &str,
         sections: Vec<Section>,
         header_action: HeaderAction,
         scroll_to: Option<usize>,
-    ) -> (
-        adw::NavigationPage,
-        Rc<RefCell<Vec<SectionUi>>>,
-        adw::WindowTitle,
-    ) {
+    ) -> (Rc<RefCell<Vec<SectionUi>>>, adw::WindowTitle) {
         let body = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(8)
@@ -321,31 +352,19 @@ impl ListPage {
             }
         });
 
-        let header = adw::HeaderBar::new();
-        header.set_show_start_title_buttons(false);
-        header.set_show_end_title_buttons(false);
-        let title_widget = adw::WindowTitle::new(title, kind);
-        header.set_title_widget(Some(&title_widget));
-
-        if let Some((label, action)) = header_action {
-            let button = gtk::Button::with_label(label);
-            button.set_widget_name("trayplay-page-action");
-            button.add_css_class("suggested-action");
-            button.connect_clicked(move |_| action());
-            header.pack_end(&button);
-        }
+        let (header, title_widget) = page_header(title, kind, header_action);
 
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
         toolbar.add_top_bar(&search_bar);
         toolbar.set_content(Some(&scroller));
 
-        let page = adw::NavigationPage::new(&toolbar, title);
-        wire_arrow_keys(&page, section_ui.clone());
+        page.set_child(Some(&toolbar));
+        wire_arrow_keys(page, section_ui.clone());
 
         // Typing anywhere on the page opens the filter bar, so the list is
         // reachable from the keyboard without hunting for a search box.
-        search_bar.set_key_capture_widget(Some(&page));
+        search_bar.set_key_capture_widget(Some(page));
 
         // Queue's "open already scrolled to what's playing" request: rows
         // have no size yet at construction time (nothing has been laid out),
@@ -378,7 +397,7 @@ impl ListPage {
             }
         }
 
-        (page, section_ui, title_widget)
+        (section_ui, title_widget)
     }
 
     /// A list page whose content can be replaced after construction, and whose
@@ -392,12 +411,13 @@ impl ListPage {
     /// after a debounced round trip for anything else. That leaves debouncing
     /// and stale-response handling to the caller, since only it knows when a
     /// query has been superseded.
-    pub fn build_dynamic(
+    pub fn fill_dynamic(
+        page: &adw::NavigationPage,
         title: &str,
         kind: &str,
         initial: Vec<Section>,
         on_query: impl Fn(String, Rc<dyn Fn(Vec<Section>)>) + 'static,
-    ) -> adw::NavigationPage {
+    ) {
         let body = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(8)
@@ -447,21 +467,15 @@ impl ListPage {
             on_query(text, render.clone());
         });
 
-        let header = adw::HeaderBar::new();
-        header.set_show_start_title_buttons(false);
-        header.set_show_end_title_buttons(false);
-        header.set_title_widget(Some(&adw::WindowTitle::new(title, kind)));
-
         let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&header);
+        toolbar.add_top_bar(&page_header(title, kind, None).0);
         toolbar.add_top_bar(&search_bar);
         toolbar.set_content(Some(&scroller));
 
-        let page = adw::NavigationPage::new(&toolbar, title);
-        wire_arrow_keys(&page, section_ui);
+        page.set_child(Some(&toolbar));
+        wire_arrow_keys(page, section_ui);
 
-        search_bar.set_key_capture_widget(Some(&page));
-        page
+        search_bar.set_key_capture_widget(Some(page));
     }
 
     /// Subtitle for an album row: release-ish context is not fetched, so the
@@ -527,6 +541,39 @@ impl ListPage {
             Kind::Other => None,
         }
     }
+}
+
+/// A page with its title already set but nothing in it yet.
+///
+/// The content is set separately because a page is now pushed before the query
+/// behind it has answered: the title and the back button are known immediately,
+/// the rows are not.
+fn blank_page(title: &str) -> adw::NavigationPage {
+    adw::NavigationPage::new(&gtk::Box::new(gtk::Orientation::Vertical, 0), title)
+}
+
+/// The header every list page shares, with the title widget handed back for the
+/// pages that correct their own subtitle later (see `LiveList::set_kind`).
+fn page_header(
+    title: &str,
+    kind: &str,
+    header_action: HeaderAction,
+) -> (adw::HeaderBar, adw::WindowTitle) {
+    let header = adw::HeaderBar::new();
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
+    let title_widget = adw::WindowTitle::new(title, kind);
+    header.set_title_widget(Some(&title_widget));
+
+    if let Some((label, action)) = header_action {
+        let button = gtk::Button::with_label(label);
+        button.set_widget_name("trayplay-page-action");
+        button.add_css_class("suggested-action");
+        button.connect_clicked(move |_| action());
+        header.pack_end(&button);
+    }
+
+    (header, title_widget)
 }
 
 /// Arrow keys across the whole page.

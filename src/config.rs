@@ -63,6 +63,16 @@ pub struct Config {
     pub random_batch: u32,
     pub cache_max_mb: u64,
     pub prefetch_next: bool,
+
+    /// How long a library query's result is reused before it is asked for
+    /// again, in seconds. Zero disables reuse entirely.
+    ///
+    /// This is browsing latency only, and it is deliberately short: the
+    /// server is the truth about the library, and going back to a page is
+    /// still how the UI refreshes it. Long enough that walking back up a
+    /// drill-down is instant, short enough that a track added to the server
+    /// shows up without restarting anything.
+    pub library_cache_ttl_secs: u64,
 }
 
 impl Default for Config {
@@ -80,6 +90,7 @@ impl Default for Config {
             random_batch: 100,
             cache_max_mb: 500,
             prefetch_next: true,
+            library_cache_ttl_secs: 300,
         }
     }
 }

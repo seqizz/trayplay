@@ -7,8 +7,12 @@ pub mod queue;
 pub mod settings;
 pub mod x11;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::future::Future;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gtk::glib;
@@ -72,16 +76,92 @@ where
     });
 }
 
+/// One cached library query.
+///
+/// Keyed by what was asked for rather than by URL: `artist_page` and
+/// `artist_tracks` ask the server the same question, so they must share an entry
+/// or the second one would refetch what the first already has.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Query {
+    Artists,
+    ArtistAlbums(String),
+    ArtistTracks(String),
+    AlbumTracks(String),
+}
+
+/// Most distinct queries kept at once.
+///
+/// A browse session touches a handful of artists; this only exists so that
+/// walking a large library for an hour cannot grow the map without bound. The
+/// oldest entries go first, which for a browse is also the least interesting.
+const MAX_CACHED_QUERIES: usize = 64;
+
+/// Cached results by query, each stamped with when it landed.
+type Entries = HashMap<Query, (Instant, Vec<Item>)>;
+
+/// Results of library queries, reused for `ttl` after they land.
+///
+/// `Rc`/`RefCell` rather than a lock: there is one `Browser`, cloned around the
+/// GTK thread, and every read and write of this happens in a GTK callback.
+#[derive(Clone)]
+struct QueryCache {
+    entries: Rc<RefCell<Entries>>,
+    ttl: Duration,
+}
+
+impl QueryCache {
+    fn get(&self, query: &Query) -> Option<Vec<Item>> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let entries = self.entries.borrow();
+        let (at, items) = entries.get(query)?;
+        (at.elapsed() < self.ttl).then(|| items.clone())
+    }
+
+    fn put(&self, query: Query, items: &[Item]) {
+        if self.ttl.is_zero() {
+            return;
+        }
+        let mut entries = self.entries.borrow_mut();
+        entries.retain(|_, (at, _)| at.elapsed() < self.ttl);
+        while entries.len() >= MAX_CACHED_QUERIES {
+            let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(query, _)| query.clone())
+            else {
+                break;
+            };
+            entries.remove(&oldest);
+        }
+        entries.insert(query, (Instant::now(), items.to_vec()));
+    }
+}
+
 /// Library queries for the UI, with results delivered on the GTK thread.
 #[derive(Clone)]
 pub struct Browser {
     rt: tokio::runtime::Handle,
     client: Arc<Client>,
+    /// Short-lived reuse of query results, so walking back up a drill-down does
+    /// not re-ask the server for the page that was on screen a moment ago.
+    /// Search and cover art are deliberately not in it: a search key is a
+    /// keystroke-shaped thing that would never be hit twice, and the art is one
+    /// request per track change rather than per page.
+    cache: QueryCache,
 }
 
 impl Browser {
-    pub fn new(rt: tokio::runtime::Handle, client: Arc<Client>) -> Self {
-        Self { rt, client }
+    pub fn new(rt: tokio::runtime::Handle, client: Arc<Client>, cache_ttl: Duration) -> Self {
+        Self {
+            rt,
+            client,
+            cache: QueryCache {
+                entries: Rc::default(),
+                ttl: cache_ttl,
+            },
+        }
     }
 
     /// For callers that need to run something on the runtime themselves - the
@@ -91,8 +171,33 @@ impl Browser {
     }
 
     pub fn artists(&self, cb: impl FnOnce(Result<Vec<Item>>) + 'static) {
-        let client = self.client.clone();
-        on_runtime(&self.rt, async move { client.artists().await }, cb);
+        self.cached(Query::Artists, cb, |client| async move {
+            client.artists().await
+        });
+    }
+
+    /// Runs `fetch` unless the cache can answer, and records what comes back.
+    ///
+    /// A hit still goes through `glib::idle_add_local_once` rather than calling
+    /// `cb` here: the callers push a page and then fill it in from this callback,
+    /// and filling it before the push had returned would be a reentrant surprise
+    /// for something that is asynchronous everywhere else.
+    fn cached<F, Fut>(&self, query: Query, cb: impl FnOnce(Result<Vec<Item>>) + 'static, fetch: F)
+    where
+        F: FnOnce(Arc<Client>) -> Fut,
+        Fut: Future<Output = Result<Vec<Item>>> + Send + 'static,
+    {
+        if let Some(items) = self.cache.get(&query) {
+            glib::idle_add_local_once(move || cb(Ok(items)));
+            return;
+        }
+        let cache = self.cache.clone();
+        on_runtime(&self.rt, fetch(self.client.clone()), move |result| {
+            if let Ok(items) = &result {
+                cache.put(query, items);
+            }
+            cb(result);
+        });
     }
 
     /// Everything an artist page needs: their albums and *all* their tracks.
@@ -108,12 +213,35 @@ impl Browser {
         artist_id: &str,
         cb: impl FnOnce(Result<(Vec<Item>, Vec<Item>)>) + 'static,
     ) {
+        let albums_key = Query::ArtistAlbums(artist_id.to_string());
+        let tracks_key = Query::ArtistTracks(artist_id.to_string());
+
+        // Both halves or neither: a partial hit would still cost the round trip
+        // that the caller is waiting on, so there is nothing to save by
+        // fetching only one of them.
+        if let (Some(albums), Some(tracks)) =
+            (self.cache.get(&albums_key), self.cache.get(&tracks_key))
+        {
+            glib::idle_add_local_once(move || cb(Ok((albums, tracks))));
+            return;
+        }
+
         let client = self.client.clone();
         let id = artist_id.to_string();
+        let cache = self.cache.clone();
         on_runtime(
             &self.rt,
             async move { tokio::try_join!(client.artist_albums(&id), client.artist_tracks(&id)) },
-            cb,
+            move |result| {
+                if let Ok((albums, tracks)) = &result {
+                    cache.put(albums_key, albums);
+                    // Shared with `artist_tracks`, which asks the server exactly
+                    // this - a search hit resolving its artist's catalogue right
+                    // after their page was open should not refetch it.
+                    cache.put(tracks_key, tracks);
+                }
+                cb(result);
+            },
         );
     }
 
@@ -125,17 +253,19 @@ impl Browser {
     }
 
     pub fn album_tracks(&self, album_id: &str, cb: impl FnOnce(Result<Vec<Item>>) + 'static) {
-        let client = self.client.clone();
         let id = album_id.to_string();
-        on_runtime(&self.rt, async move { client.album_tracks(&id).await }, cb);
+        self.cached(Query::AlbumTracks(id.clone()), cb, |client| async move {
+            client.album_tracks(&id).await
+        });
     }
 
     /// Every track by an artist, regardless of album - the fallback for a
     /// Library search hit with no album of its own to queue.
     pub fn artist_tracks(&self, artist_id: &str, cb: impl FnOnce(Result<Vec<Item>>) + 'static) {
-        let client = self.client.clone();
         let id = artist_id.to_string();
-        on_runtime(&self.rt, async move { client.artist_tracks(&id).await }, cb);
+        self.cached(Query::ArtistTracks(id.clone()), cb, |client| async move {
+            client.artist_tracks(&id).await
+        });
     }
 
     /// Fetches cover art. Bytes rather than a texture because the conversion

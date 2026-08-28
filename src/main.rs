@@ -94,7 +94,11 @@ fn main() -> Result<()> {
             mpris::spawn(handle.clone(), tx.clone(), client.clone());
             Some(ui::Session {
                 player: handle,
-                browser: ui::Browser::new(rt.handle().clone(), client),
+                browser: ui::Browser::new(
+                    rt.handle().clone(),
+                    client,
+                    std::time::Duration::from_secs(cfg.library_cache_ttl_secs),
+                ),
             })
         }
         Ok(None) => None,

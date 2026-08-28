@@ -44,6 +44,7 @@ Selectors are a stability contract — renames are treated as breaking changes.
 | `#trayplay-filter` / `#trayplay-filter-entry` | type-to-filter bar on list pages |
 | `.trayplay-row` | a row in those lists |
 | `#trayplay-page-action` | header button on a list page ("Play") |
+| `#trayplay-loading` | spinner on a list page whose query has not answered yet |
 | `#trayplay-status` | signed-out text |
 | `#trayplay-toast` | toast overlay wrapping the navigation stack; the banner itself is libadwaita's `.toast` node inside it |
 | `#trayplay-row-menu` | a row's right-click menu; its entries are `button` nodes inside it |

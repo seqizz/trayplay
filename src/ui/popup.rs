@@ -423,13 +423,21 @@ const LIBRARY_SEARCH_LIMIT: u32 = 60;
 const LIBRARY_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn push_artists(nav: &adw::NavigationView, session: &Session) {
+    let page = ListPage::pending("Library", "Artists");
+    nav.push(&page);
+
     let nav_weak = nav.downgrade();
+    let page_weak = page.downgrade();
     let session = session.clone();
     session.browser.clone().artists(move |result| {
         let Some(nav) = nav_weak.upgrade() else { return };
+        let Some(page) = page_weak.upgrade() else { return };
         let artists = match result {
             Ok(items) => items,
-            Err(err) => return toast_error("Library", &err),
+            Err(err) => {
+                toast_error("Library", &err);
+                return dismiss_pending(&nav, &page);
+            }
         };
 
         // Bumped on every keystroke so a slow search that lands after a newer
@@ -441,7 +449,7 @@ fn push_artists(nav: &adw::NavigationView, session: &Session) {
         let session_query = session.clone();
         let artists_for_query = artists.clone();
 
-        let page = ListPage::build_dynamic("Library", "Artists", vec![artist_section(artists, &nav, &session)], {
+        ListPage::fill_dynamic(&page, "Library", "Artists", vec![artist_section(artists, &nav, &session)], {
             move |text, render| {
                 let gen = generation.get().wrapping_add(1);
                 generation.set(gen);
@@ -475,8 +483,18 @@ fn push_artists(nav: &adw::NavigationView, session: &Session) {
                 });
             }
         });
-        nav.push(&page);
     });
+}
+
+/// Drops a pending page whose query failed, leaving the toast to explain why.
+///
+/// Only when it is still the visible one: a failure slow enough to land after
+/// the user has navigated on would otherwise pop whatever they are looking at
+/// now instead of the page it belongs to.
+fn dismiss_pending(nav: &adw::NavigationView, page: &adw::NavigationPage) {
+    if nav.visible_page().as_ref() == Some(page) {
+        nav.pop();
+    }
 }
 
 /// Turns a row index into the tracks that row stands for, and hands them to
@@ -713,18 +731,26 @@ fn play_shuffled_or_random(player: &PlayerHandle, tracks: Vec<Item>, chosen: &It
 /// album. Badly tagged libraries do have those, and an album list alone hides
 /// them completely.
 fn push_albums(nav: &adw::NavigationView, session: &Session, artist_id: &str, artist_name: &str) {
-    let nav_weak = nav.downgrade();
-    let session = session.clone();
     let title = artist_name.to_string();
+    let page = ListPage::pending(&title, "Albums");
+    nav.push(&page);
+
+    let nav_weak = nav.downgrade();
+    let page_weak = page.downgrade();
+    let session = session.clone();
 
     session
         .browser
         .clone()
         .artist_page(artist_id, move |result| {
             let Some(nav) = nav_weak.upgrade() else { return };
+            let Some(page) = page_weak.upgrade() else { return };
             let (albums, tracks) = match result {
                 Ok(pair) => pair,
-                Err(err) => return toast_error(&title, &err),
+                Err(err) => {
+                    toast_error(&title, &err);
+                    return dismiss_pending(&nav, &page);
+                }
             };
 
             // Only the album-less tracks are listed - the rest are reachable
@@ -787,14 +813,18 @@ fn push_albums(nav: &adw::NavigationView, session: &Session, artist_id: &str, ar
                 );
             }
 
-            nav.push(&ListPage::build_sections(&title, "Albums", sections, None));
+            ListPage::fill_sections(&page, &title, "Albums", sections, None);
         });
 }
 
 fn push_tracks(nav: &adw::NavigationView, session: &Session, album_id: &str, album_name: &str) {
-    let nav_weak = nav.downgrade();
-    let session = session.clone();
     let title = album_name.to_string();
+    let page = ListPage::pending(&title, "Tracks");
+    nav.push(&page);
+
+    let nav_weak = nav.downgrade();
+    let page_weak = page.downgrade();
+    let session = session.clone();
     let album_id = album_id.to_string();
 
     session
@@ -802,9 +832,13 @@ fn push_tracks(nav: &adw::NavigationView, session: &Session, album_id: &str, alb
         .clone()
         .album_tracks(&album_id, move |result| {
             let Some(nav) = nav_weak.upgrade() else { return };
+            let Some(page) = page_weak.upgrade() else { return };
             let items = match result {
                 Ok(items) => items,
-                Err(err) => return toast_error(&title, &err),
+                Err(err) => {
+                    toast_error(&title, &err);
+                    return dismiss_pending(&nav, &page);
+                }
             };
 
             // Activating a track plays it and shuffles the rest of the album
@@ -832,7 +866,8 @@ fn push_tracks(nav: &adw::NavigationView, session: &Session, album_id: &str, alb
             })
             .with_menu(menu);
 
-            let page = ListPage::build_sections(
+            ListPage::fill_sections(
+                &page,
                 &title,
                 "Tracks",
                 vec![section],
@@ -849,7 +884,6 @@ fn push_tracks(nav: &adw::NavigationView, session: &Session, album_id: &str, alb
                     }),
                 )),
             );
-            nav.push(&page);
         });
 }
 

@@ -149,6 +149,7 @@ x11_window_type    = "utility"     # X11 only; this is the default
 random_batch       = 100
 cache_max_mb       = 500           # initial value only; the settings page owns it
 prefetch_next      = true
+library_cache_ttl_secs = 300       # reuse a browse query for this long; 0 disables
 ```
 
 `anchor` and `margin` only take effect under Wayland/layer-shell. On X11 the window

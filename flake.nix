@@ -298,11 +298,8 @@
         # updating it is a copy-paste and a commit. Old entries can stay - they
         # cost nothing and document what was released.
         prebuiltHashes = {
-          "0.2.0" = {
-            x86_64-linux = "sha256-YfEDOvpfKm1iJjsp0Yglos0AGV2U1CNJr90zDxu4+AQ=";
-          };
-          "0.2.1" = {
-            x86_64-linux = "sha256-TDPEOfrsuTZDT04ExwvhE7GMpm/ceK++4/mZ0MTQ80E=";
+          "0.3.1" = {
+            x86_64-linux = "sha256-i9QzRiADlgWZZAnq9kEGAzkhyzcJPeejv8gnjxBXTXg=";
           };
           "0.3.0" = {
             x86_64-linux = "sha256-R+Hr+d0mjre1w7eKtYvTZ+0L5HJBaDWFACKvJTT1Z9s=";
