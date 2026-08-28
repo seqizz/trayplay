@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 /// Jellyfin expresses durations in 100-nanosecond ticks.
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
+/// A position expressed the way Jellyfin wants it in playback reports.
+///
+/// The inverse of `Item::duration`, and the reason `TICKS_PER_SECOND` is not
+/// private to this file's parsing side any more.
+pub fn ticks(position: Duration) -> i64 {
+    (position.as_secs_f64() * TICKS_PER_SECOND as f64) as i64
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct AuthResponse {

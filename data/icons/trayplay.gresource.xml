@@ -8,6 +8,7 @@
 <gresources>
   <gresource prefix="/dev/trayplay/Trayplay/icons">
     <file preprocess="xml-stripblanks">scalable/actions/trayplay-shuffle-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/trayplay-mix-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/trayplay-library-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/trayplay-queue-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/trayplay-prev-symbolic.svg</file>

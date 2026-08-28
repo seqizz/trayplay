@@ -422,6 +422,10 @@ const LIBRARY_SEARCH_LIMIT: u32 = 60;
 /// typing to pause before asking.
 const LIBRARY_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Rows a ranked destination asks the server for. A whole page's worth, since
+/// each one *is* a page now rather than a few rows above the artist list.
+const RANKED_LIMIT: u32 = 100;
+
 fn push_artists(nav: &adw::NavigationView, session: &Session) {
     let page = ListPage::pending("Library", "Artists");
     nav.push(&page);
@@ -449,14 +453,19 @@ fn push_artists(nav: &adw::NavigationView, session: &Session) {
         let session_query = session.clone();
         let artists_for_query = artists.clone();
 
-        ListPage::fill_dynamic(&page, "Library", "Artists", vec![artist_section(artists, &nav, &session)], {
+        let initial = library_sections(artists, &nav, &session);
+        ListPage::fill_dynamic(&page, "Library", "Artists", initial, {
             move |text, render| {
                 let gen = generation.get().wrapping_add(1);
                 generation.set(gen);
 
                 if text.is_empty() {
                     let Some(nav) = nav_for_query.upgrade() else { return };
-                    render(vec![artist_section(artists_for_query.clone(), &nav, &session_query)]);
+                    render(library_sections(
+                        artists_for_query.clone(),
+                        &nav,
+                        &session_query,
+                    ));
                     return;
                 }
 
@@ -642,6 +651,231 @@ fn resolve_search(session: &Session, items: Vec<Item>) -> Resolve {
             Kind::Track | Kind::Other => done(vec![item.clone()]),
         }
     })
+}
+
+/// One of the Library page's server-ranked destinations.
+///
+/// Ranked by the server, not by us: play counts and last-played dates live there
+/// (and only exist at all because `crate::report` sends them), and "newest" is a
+/// property of when the file was added to the library, which this side never
+/// sees.
+#[derive(Debug, Clone, Copy)]
+enum Ranked {
+    RecentAlbums,
+    MostPlayed,
+    RecentlyPlayed,
+}
+
+impl Ranked {
+    /// In the order they appear on the Library page.
+    const ALL: [Self; 3] = [Self::RecentAlbums, Self::MostPlayed, Self::RecentlyPlayed];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::RecentAlbums => "Recently added",
+            Self::MostPlayed => "Most played",
+            Self::RecentlyPlayed => "Recently played",
+        }
+    }
+
+    /// What the rows of its page are, for the header's second line.
+    fn kind(self) -> &'static str {
+        match self {
+            Self::RecentAlbums => "Albums",
+            Self::MostPlayed | Self::RecentlyPlayed => "Tracks",
+        }
+    }
+
+    /// The link row's subtitle. Each says how its page is ordered, which is the
+    /// only thing about a destination that is not already in its name.
+    fn ordering(self) -> &'static str {
+        match self {
+            Self::RecentAlbums => "Newest first",
+            Self::MostPlayed => "By play count",
+            Self::RecentlyPlayed => "Most recent first",
+        }
+    }
+}
+
+/// The Library page as it stands with nothing typed into its filter box: the
+/// three ranked destinations as one row each, then the artist list.
+///
+/// One row rather than the section itself (operator's call, 2026-08-28): twenty
+/// rows apiece pushed the artist list three screens down, and a destination can
+/// hold a whole page of results instead of a preview of them. It also means
+/// Library costs one query again - each destination fetches when it is opened.
+///
+/// Rebuilt rather than kept, because a `Section` owns its activation closures and
+/// cannot be cloned; clearing the filter box goes through here again.
+fn library_sections(
+    artists: Vec<Item>,
+    nav: &adw::NavigationView,
+    session: &Session,
+) -> Vec<Section> {
+    vec![
+        ranked_section(nav, session),
+        // The link rows above are self-describing and sit directly under the page
+        // header, so only this one needs saying.
+        artist_section(artists, nav, session).with_heading("Artists"),
+    ]
+}
+
+/// The three link rows. No menu: there is nothing behind them yet to enqueue,
+/// and resolving one would mean running its query for a right-click.
+fn ranked_section(nav: &adw::NavigationView, session: &Session) -> Section {
+    let items: Vec<Item> = Ranked::ALL
+        .iter()
+        .map(|ranked| link_item(ranked.title()))
+        .collect();
+
+    let nav_weak = nav.downgrade();
+    let session = session.clone();
+    Section::new(
+        items,
+        |item| {
+            Ranked::ALL
+                .iter()
+                .find(|ranked| ranked.title() == item.name)
+                .map(|ranked| ranked.ordering().to_string())
+        },
+        move |index| {
+            let Some(nav) = nav_weak.upgrade() else { return };
+            let Some(ranked) = Ranked::ALL.get(index) else {
+                return;
+            };
+            push_ranked(&nav, &session, *ranked);
+        },
+    )
+}
+
+/// A row that stands for a destination rather than for something in the library.
+///
+/// `Section` is built out of `Item`s, so a link row needs one to hang on. The id
+/// is empty and nothing ever reads it: these rows only navigate, they carry no
+/// menu, and they are never handed to the player.
+fn link_item(name: &str) -> Item {
+    Item {
+        id: String::new(),
+        name: name.to_string(),
+        item_type: None,
+        album: None,
+        album_id: None,
+        album_artist: None,
+        artists: Vec::new(),
+        artist_items: Vec::new(),
+        run_time_ticks: None,
+        index_number: None,
+        parent_index_number: None,
+        container: None,
+        image_tags: std::collections::HashMap::new(),
+        album_primary_image_tag: None,
+    }
+}
+
+/// One ranked destination's own page.
+///
+/// Same push-then-fill shape as every other browse page, so the spinner and the
+/// covered rows behind it come for free.
+fn push_ranked(nav: &adw::NavigationView, session: &Session, ranked: Ranked) {
+    let page = ListPage::pending(ranked.title(), ranked.kind());
+    nav.push(&page);
+
+    let nav_weak = nav.downgrade();
+    let page_weak = page.downgrade();
+    let browser = session.browser.clone();
+    let session = session.clone();
+
+    let fill = move |result: anyhow::Result<Vec<Item>>| {
+        let Some(nav) = nav_weak.upgrade() else { return };
+        let Some(page) = page_weak.upgrade() else { return };
+        let items = match result {
+            Ok(items) => items,
+            Err(err) => {
+                toast_error(ranked.title(), &err);
+                return dismiss_pending(&nav, &page);
+            }
+        };
+
+        match ranked {
+            // Albums navigate, like an album row anywhere else, so there is
+            // nothing for a header Play button to play.
+            Ranked::RecentAlbums => ListPage::fill_sections(
+                &page,
+                ranked.title(),
+                ranked.kind(),
+                vec![album_section(items, &nav, &session)],
+                None,
+            ),
+            // A track page gets the same header Play as an album's: rows shuffle
+            // their scope, and listing order stays available.
+            Ranked::MostPlayed | Ranked::RecentlyPlayed => {
+                let player = session.player.clone();
+                let all = items.clone();
+                let nav_all = nav.downgrade();
+                ListPage::fill_sections(
+                    &page,
+                    ranked.title(),
+                    ranked.kind(),
+                    vec![track_section(items, &nav, &session)],
+                    Some((
+                        "Play",
+                        Box::new(move || {
+                            player.send(Command::PlayItems {
+                                items: all.clone(),
+                                start: 0,
+                            });
+                            if let Some(nav) = nav_all.upgrade() {
+                                nav.pop_to_tag("now-playing");
+                            }
+                        }),
+                    )),
+                )
+            }
+        }
+    };
+
+    match ranked {
+        Ranked::RecentAlbums => browser.recent_albums(RANKED_LIMIT, fill),
+        Ranked::MostPlayed => browser.most_played(RANKED_LIMIT, fill),
+        Ranked::RecentlyPlayed => browser.recently_played(RANKED_LIMIT, fill),
+    }
+}
+
+/// Album rows that navigate into their tracks - the same meaning an album row
+/// has on an artist page.
+fn album_section(albums: Vec<Item>, nav: &adw::NavigationView, session: &Session) -> Section {
+    let nav_weak = nav.downgrade();
+    let menu = enqueue_actions(&session.player, resolve_albums(session, albums.clone()));
+    let session = session.clone();
+    let rows = albums.clone();
+    Section::new(albums, ListPage::album_subtitle, move |index| {
+        let Some(nav) = nav_weak.upgrade() else { return };
+        let Some(album) = rows.get(index) else { return };
+        push_tracks(&nav, &session, &album.id, &album.name);
+    })
+    .with_menu(menu)
+}
+
+/// Track rows on a page that is not an album's.
+///
+/// Activation is the app's usual track-row meaning - play this, shuffle the rest
+/// of the scope behind it - and the scope here is the section itself, which is
+/// the only list the row belongs to.
+fn track_section(tracks: Vec<Item>, nav: &adw::NavigationView, session: &Session) -> Section {
+    let nav_weak = nav.downgrade();
+    let menu = enqueue_actions(&session.player, resolve_tracks(tracks.clone()));
+    let player = session.player.clone();
+    let rows = tracks.clone();
+    Section::new(tracks, ListPage::track_context_subtitle, move |index| {
+        player.send(Command::PlayShuffled {
+            items: rows.clone(),
+            first: index,
+        });
+        if let Some(nav) = nav_weak.upgrade() {
+            nav.pop_to_tag("now-playing");
+        }
+    })
+    .with_menu(menu)
 }
 
 /// The default Library content: every artist, activating into their albums.
@@ -1027,6 +1261,13 @@ fn spawn_event_loop(
                 }
                 Event::Position(pos) => now_playing.set_position(pos),
                 Event::Seeked(pos) => now_playing.set_seeked(pos),
+                // Through the same overlay as an error, and logged for the same
+                // reason: the popup is usually hidden, so a toast nobody was
+                // there for should still leave a record.
+                Event::Notice(message) => {
+                    tracing::info!(message, "player notice");
+                    toaster.show(message);
+                }
                 Event::Failed(message) => {
                     // The load this reports (if it was one) is over, so the bar
                     // must not be left running behind the toast.

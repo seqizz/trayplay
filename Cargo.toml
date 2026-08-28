@@ -1,6 +1,6 @@
 [package]
 name = "trayplay"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Systray Jellyfin music player with MPRIS support"
 license = "MIT"

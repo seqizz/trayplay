@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use super::auth::{device_id, Credentials};
-use super::models::{AuthResponse, Item, ItemsResponse};
+use super::models::{self, AuthResponse, Item, ItemsResponse};
 
 const CLIENT_NAME: &str = "trayplay";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -112,6 +112,24 @@ impl Client {
         };
         self.creds = Some(creds.clone());
         Ok(creds)
+    }
+
+    /// POST with no useful reply, which is every playback-reporting endpoint.
+    ///
+    /// Errors come back rather than being logged here: the caller knows which
+    /// report failed, and none of them is worth interrupting playback for.
+    async fn post_json(&self, path: &str, body: serde_json::Value) -> Result<()> {
+        let url = format!("{}{}", self.base, path);
+        self.http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .with_context(|| format!("POST {url}"))?;
+        Ok(())
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
@@ -251,6 +269,145 @@ impl Client {
             )
             .await?;
         Ok(resp.items)
+    }
+
+    /// A server-built queue of tracks similar to `item_id`.
+    ///
+    /// Nothing here could produce this list: it comes out of Jellyfin's own
+    /// similarity scoring over genres, artists and play history. The seed track
+    /// is normally the first result, so the queue is played from index 0.
+    pub async fn instant_mix(&self, item_id: &str, limit: u32) -> Result<Vec<Item>> {
+        let resp: ItemsResponse = self
+            .get_json(
+                &format!("/Items/{item_id}/InstantMix"),
+                &[
+                    ("userId", self.user_id()?.to_string()),
+                    ("limit", limit.to_string()),
+                    ("fields", "Container,ArtistItems".into()),
+                    ("enableTotalRecordCount", "false".into()),
+                ],
+            )
+            .await?;
+        Ok(resp.items)
+    }
+
+    /// Albums newest first, for the Library page's top section.
+    ///
+    /// Albums rather than tracks: a rip lands as one album's worth of files at
+    /// once, so a track-level list of the same thing is one album repeated
+    /// twelve times.
+    pub async fn recent_albums(&self, limit: u32) -> Result<Vec<Item>> {
+        let resp: ItemsResponse = self
+            .get_json(
+                "/Items",
+                &[
+                    ("userId", self.user_id()?.to_string()),
+                    ("includeItemTypes", "MusicAlbum".into()),
+                    ("recursive", "true".into()),
+                    ("sortBy", "DateCreated".into()),
+                    ("sortOrder", "Descending".into()),
+                    ("limit", limit.to_string()),
+                    ("enableTotalRecordCount", "false".into()),
+                ],
+            )
+            .await?;
+        Ok(resp.items)
+    }
+
+    /// Most-played and last-played tracks.
+    ///
+    /// `filters=IsPlayed` is what keeps these honest on a library larger than
+    /// `limit`: without it the tail of the list is filled with tracks that have
+    /// never been played at all, since a play count of zero still sorts.
+    ///
+    /// Both are empty until something has reported a play, which is what
+    /// `crate::report` exists for - Jellyfin only knows what it has been told.
+    pub async fn most_played_tracks(&self, limit: u32) -> Result<Vec<Item>> {
+        self.played_tracks("PlayCount", limit).await
+    }
+
+    pub async fn recently_played_tracks(&self, limit: u32) -> Result<Vec<Item>> {
+        self.played_tracks("DatePlayed", limit).await
+    }
+
+    async fn played_tracks(&self, sort_by: &str, limit: u32) -> Result<Vec<Item>> {
+        let resp: ItemsResponse = self
+            .get_json(
+                "/Items",
+                &[
+                    ("userId", self.user_id()?.to_string()),
+                    ("includeItemTypes", "Audio".into()),
+                    ("recursive", "true".into()),
+                    ("sortBy", sort_by.to_string()),
+                    ("sortOrder", "Descending".into()),
+                    ("filters", "IsPlayed".into()),
+                    ("limit", limit.to_string()),
+                    ("fields", "Container,ArtistItems".into()),
+                    ("enableTotalRecordCount", "false".into()),
+                ],
+            )
+            .await?;
+        Ok(resp.items)
+    }
+
+    /// Tells the server a track has started.
+    ///
+    /// The session these reports attach to is identified by the token and the
+    /// `DeviceId` already in `auth_header`, so there is nothing extra to pass -
+    /// and no `PlaySessionId`, which Jellyfin only needs to reconcile its own
+    /// transcodes.
+    ///
+    /// `PlayMethod` is deliberately omitted rather than guessed: `stream_url`
+    /// uses the universal endpoint, so whether the server direct-played or
+    /// transcoded is its decision and not something this side is told.
+    pub async fn report_playback_start(&self, item_id: &str, position: Duration) -> Result<()> {
+        self.post_json(
+            "/Sessions/Playing",
+            json!({
+                "ItemId": item_id,
+                "PositionTicks": models::ticks(position),
+                "IsPaused": false,
+                "CanSeek": true,
+            }),
+        )
+        .await
+    }
+
+    /// Where playback has reached, and whether it is paused.
+    ///
+    /// `IsPaused` is the field the dashboard reads; the optional `EventName`
+    /// that could also carry "Pause"/"Unpause" is informational, so it is left
+    /// out rather than risk sending a value the server's enum does not have.
+    pub async fn report_playback_progress(
+        &self,
+        item_id: &str,
+        position: Duration,
+        paused: bool,
+    ) -> Result<()> {
+        self.post_json(
+            "/Sessions/Playing/Progress",
+            json!({
+                "ItemId": item_id,
+                "PositionTicks": models::ticks(position),
+                "IsPaused": paused,
+                "CanSeek": true,
+            }),
+        )
+        .await
+    }
+
+    /// Ends playback of a track. This is the report that decides whether
+    /// Jellyfin marks the track played and bumps its play count, so the
+    /// position it carries has to be the real one.
+    pub async fn report_playback_stopped(&self, item_id: &str, position: Duration) -> Result<()> {
+        self.post_json(
+            "/Sessions/Playing/Stopped",
+            json!({
+                "ItemId": item_id,
+                "PositionTicks": models::ticks(position),
+            }),
+        )
+        .await
     }
 
     /// One item by id. Nothing calls it today - every page fetches lists - but

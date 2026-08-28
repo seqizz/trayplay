@@ -73,6 +73,16 @@ pub struct Config {
     /// drill-down is instant, short enough that a track added to the server
     /// shows up without restarting anything.
     pub library_cache_ttl_secs: u64,
+
+    /// Tell the server what is being played: play counts, "last played" dates,
+    /// and the dashboard's Now Playing entry.
+    ///
+    /// On by default, because a Jellyfin client that does not report is a client
+    /// whose listening never happened as far as the rest of the server is
+    /// concerned - the Library page's "Most played" and "Recently played"
+    /// sections are built from this data and stay empty without it. Turn it off
+    /// to keep playback off the server's record entirely.
+    pub report_playback: bool,
 }
 
 impl Default for Config {
@@ -91,6 +101,7 @@ impl Default for Config {
             cache_max_mb: 500,
             prefetch_next: true,
             library_cache_ttl_secs: 300,
+            report_playback: true,
         }
     }
 }

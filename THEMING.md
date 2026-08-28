@@ -27,10 +27,11 @@ Selectors are a stability contract — renames are treated as breaking changes.
 | `#trayplay-seek.seeking` | set while a seek is issued but not yet in effect; pulses `trough highlight` |
 | `#trayplay-loading` | thin bar overlaid on the bottom edge of the seek slider while a track is being loaded (download, or a server-side transcode). Style through its GTK nodes: `trough` and `progress`. Hidden entirely for a load shorter than the grace period, and it *pulses* rather than filling when the server sends no `Content-Length` — the timings are constants in `src/ui/nowplaying.rs` and are not themable |
 | `#trayplay-seek value` | elapsed time, drawn above the handle. Always present so its height never shifts the layout; `#trayplay-seek.showing-value` is what makes it visible, on hover. There are no permanent elapsed/total labels |
-| `#trayplay-transport` | centre box holding the transport buttons, with repeat at its left end and shuffle at its right |
+| `#trayplay-transport` | centre box holding the transport buttons, with repeat at its left end and shuffle + instant mix at its right |
 | `.trayplay-glyph` | transport controls, drawn as bare glyphs — the rule that strips the button shape in every state. Adwaita's `.flat` is not enough, it still paints a hover background |
 | `#trayplay-prev` / `#trayplay-play` / `#trayplay-next` | transport buttons. Glyph *sizes* are not themable: `GLYPH_SIZE` / `PLAY_GLYPH_SIZE` in `src/ui/nowplaying.rs` are set with `set_pixel_size`, which CSS cannot override |
 | `#trayplay-random` | shuffle, at the right of the transport row |
+| `#trayplay-mix` | instant mix, beside shuffle. Insensitive while nothing is playing, since the mix is seeded from the current track. Drawn at `MIX_GLYPH_SIZE` rather than `GLYPH_SIZE`, correcting for artwork that fills more of its canvas than its neighbours — not themable either, same as the rest |
 | `#trayplay-repeat` | repeat, at the left of the transport row. `#trayplay-repeat.repeat-active` is set while repeat is on (either kind), since the three glyphs are close at this size |
 | `#trayplay-actions` | bottom action row |
 | `#trayplay-settings` | settings button, bottom left, square |

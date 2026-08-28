@@ -233,7 +233,10 @@ async fn run(
                     tracing::warn!(%err, "cannot publish loop status");
                 }
             }
-            Ok(Event::Failed(_)) => {}
+            // Both are messages for the popup. MPRIS has nowhere to put a
+            // sentence: the spec has no notification channel, and a client
+            // showing one would have to have invented it.
+            Ok(Event::Failed(_)) | Ok(Event::Notice(_)) => {}
             // MPRIS has no notion of buffering: a client sees the old track
             // until the new one actually starts, which is when `TrackChanged`
             // republishes the metadata.

@@ -58,7 +58,18 @@ session list, deleting it just creates a new session entry.
 
 There is no separate search page, every list page filters as you type. On the
 Library page that filter goes to the server and searches artists, albums *and*
-tracks, so you can find a record without remembering who made it.
+tracks, so you can find a record without remembering who made it. Above the
+artist list that page carries three rows you can enter — **Recently added**,
+**Most played** and **Recently played** — each a list the server ranked. The last
+two are built from playback reports, so they need `report_playback` (on by
+default) and stay empty until something has been listened to.
+
+**Instant mix** is the button beside shuffle. It asks Jellyfin for tracks like the
+one playing now — its own similarity scoring over genres, artists and play
+history — and puts them in the queue *behind* it. The song you pressed it on keeps
+playing; only what comes next changes, and a toast confirms it, since nothing on
+screen otherwise would. Unlike random play the result is finite: it does not
+refill, so the mix stays a mix.
 
 **Queue** shows what the player is holding, with the current track marked; it
 updates live and is restored when trayplay starts again. Activating a row plays
@@ -150,7 +161,14 @@ random_batch       = 100
 cache_max_mb       = 500           # initial value only; the settings page owns it
 prefetch_next      = true
 library_cache_ttl_secs = 300       # reuse a browse query for this long; 0 disables
+report_playback    = true          # tell the server what is played
 ```
+
+`report_playback` is what gives the server play counts, "last played" dates and a
+Now Playing entry in its dashboard — and with them the Library page's "Most
+played" and "Recently played" lists, which are built from that same data and stay
+empty without it. Set it to `false` to keep listening off the server's
+record.
 
 `anchor` and `margin` only take effect under Wayland/layer-shell. On X11 the window
 manager decides placement (see below).

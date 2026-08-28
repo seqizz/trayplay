@@ -5,6 +5,7 @@ mod icons;
 mod jellyfin;
 mod mpris;
 mod player;
+mod report;
 mod theme;
 mod tray;
 mod ui;
@@ -92,6 +93,12 @@ fn main() -> Result<()> {
     let session = match start_player(&cfg, &rt) {
         Ok(Some((handle, client))) => {
             mpris::spawn(handle.clone(), tx.clone(), client.clone());
+            // Before `Command::Restore` is sent below, like every other
+            // subscriber - though this one has nothing to do with the restore
+            // event, since a restored session is not playing.
+            if cfg.report_playback {
+                report::spawn(rt.handle(), &handle, client.clone());
+            }
             Some(ui::Session {
                 player: handle,
                 browser: ui::Browser::new(

@@ -523,21 +523,31 @@ impl ListPage {
         }
     }
 
+    /// Subtitle for a track row on a page that is not its album's - a Library
+    /// search hit, or one of the Library page's own "Most played" / "Recently
+    /// played" sections.
+    ///
+    /// Both the artists and the album, because nothing around the row supplies
+    /// either: `track_subtitle` can drop the artists precisely because the page
+    /// it is on is already headed by them, and that is not the case here.
+    ///
+    /// Every credited artist, not the album artist, for the usual reason - the
+    /// latter would answer "Various Artists".
+    pub fn track_context_subtitle(item: &Item) -> Option<String> {
+        let artists = item.display_artists();
+        match item.album.as_deref() {
+            Some(album) if !album.is_empty() => Some(format!("{artists} · {album}")),
+            _ => Some(artists),
+        }
+    }
+
     /// Subtitle for a Library search hit: results mix artists, albums and
     /// tracks with nothing else on the row to tell them apart.
     pub fn search_subtitle(item: &Item) -> Option<String> {
         match item.kind() {
             Kind::Artist => Some("Artist".to_string()),
             Kind::Album => Some(item.album_artist.clone().unwrap_or_else(|| "Album".to_string())),
-            Kind::Track => {
-                // Every credited artist, not the album artist: a search hit has
-                // no page around it to say who is on the track.
-                let artists = item.display_artists();
-                match item.album.as_deref() {
-                    Some(album) if !album.is_empty() => Some(format!("{artists} · {album}")),
-                    _ => Some(artists),
-                }
-            }
+            Kind::Track => Self::track_context_subtitle(item),
             Kind::Other => None,
         }
     }

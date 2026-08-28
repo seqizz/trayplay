@@ -83,6 +83,8 @@
               $out/share/licenses/trayplay/phosphor-LICENSE
             install -Dm644 data/icons/qlementine/LICENSE \
               $out/share/licenses/trayplay/qlementine-LICENSE
+            install -Dm644 data/icons/fontawesome/LICENSE \
+              $out/share/licenses/trayplay/fontawesome-LICENSE
             # MynaUI's terms (MIT, no attribution required) were never in hand as
             # upstream text, so its SOURCES.md is the record - see CLAUDE.md.
             install -Dm644 data/icons/mynaui/SOURCES.md \
@@ -298,11 +300,8 @@
         # updating it is a copy-paste and a commit. Old entries can stay - they
         # cost nothing and document what was released.
         prebuiltHashes = {
-          "0.3.1" = {
-            x86_64-linux = "sha256-i9QzRiADlgWZZAnq9kEGAzkhyzcJPeejv8gnjxBXTXg=";
-          };
-          "0.3.0" = {
-            x86_64-linux = "sha256-R+Hr+d0mjre1w7eKtYvTZ+0L5HJBaDWFACKvJTT1Z9s=";
+          "0.3.2" = {
+            x86_64-linux = "sha256-VaSdBkOzpI6L8N791sO8/oRuK8OPYLcYCD04gD2xYI0=";
           };
         };
 

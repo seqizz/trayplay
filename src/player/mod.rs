@@ -43,6 +43,13 @@ const MAX_MISSING_SKIPS: usize = 16;
 /// unaffected.
 const PREQUEUE_LEAD: Duration = Duration::from_secs(10);
 
+/// How many tracks an instant mix asks the server for.
+///
+/// Its own constant rather than `random_batch`: that one is a refill size for a
+/// queue that tops itself up forever, while a mix is fetched once and then runs
+/// out on purpose, so the two would drift apart the moment either was tuned.
+const INSTANT_MIX_TRACKS: u32 = 100;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum State {
     #[default]
@@ -66,6 +73,12 @@ pub enum Command {
     /// Play an explicit list, starting at an index. Used by the album track list
     /// so picking a track plays the rest of the album after it.
     PlayItems { items: Vec<Item>, start: usize },
+    /// Replace the queue with a server-built mix seeded from one track.
+    ///
+    /// Fetched here rather than by the UI for the same reason as `PlayAlbum`:
+    /// the player owns the client, and the caller has nothing to do with the
+    /// result but hand it straight back.
+    PlayInstantMix(String),
     /// Play one track now and shuffle the rest of its scope behind it.
     ///
     /// What a track row in a browse page does: picking a song is a choice about
@@ -170,6 +183,14 @@ pub enum Event {
     /// A seek was performed. MPRIS clients need this to resync their own
     /// position estimate rather than waiting for the next poll.
     Seeked(Duration),
+    /// Something worth telling the user that is not a failure.
+    ///
+    /// Exists for instant mix, which deliberately changes nothing on screen - the
+    /// track carries on playing and the popup does not navigate - so without a
+    /// word from the app a working button and a dead one look identical. Same
+    /// reasoning as the enqueue toasts, except the *player* is what fetched the
+    /// mix, so only it knows how it went.
+    Notice(String),
     /// Recoverable failure worth surfacing in the UI.
     Failed(String),
 }
@@ -342,6 +363,7 @@ impl Player {
                 self.queue.replace(items, start, Mode::Explicit);
                 self.start_current().await?;
             }
+            Command::PlayInstantMix(seed_id) => self.play_instant_mix(&seed_id).await?,
             Command::PlayShuffled { mut items, first } => {
                 if items.is_empty() || first >= items.len() {
                     return Ok(());
@@ -629,6 +651,105 @@ impl Player {
         }
         self.queue.replace(tracks, 0, Mode::Random);
         self.start_current().await
+    }
+
+    /// Builds a server-chosen mix around the track playing now.
+    ///
+    /// **It does not restart that track.** The point of pressing this is "more
+    /// like *this one*", and the first version delivered that by playing the mix
+    /// from index 0 - where the server puts the seed - which took the song away
+    /// in order to give it back from the top. So the mix replaces the queue
+    /// *behind* the current track instead, playback carries straight on, and the
+    /// only thing that changes is what comes next. The queue page updates itself
+    /// from `QueueChanged`, and `Notice` is what says so on the root view, which
+    /// shows nothing about the queue at all.
+    ///
+    /// The history behind the cursor is kept, so Previous still walks back into
+    /// what was playing before the mix.
+    async fn play_instant_mix(&mut self, seed_id: &str) -> Result<()> {
+        // No `Loading` here, unlike every other fetch in this actor, and the
+        // asymmetry is deliberate: that indicator means "playback is stalled
+        // waiting for something", which is now false - the current track plays
+        // right through this. Emitting it would also strand the bar on screen,
+        // since `TrackChanged` is what clears it and there is no longer one.
+        let mix = self
+            .client
+            .instant_mix(seed_id, INSTANT_MIX_TRACKS)
+            .await
+            .context("fetching an instant mix")?;
+        if mix.is_empty() {
+            self.emit(Event::Failed("the server has no mix for this track".into()));
+            return Ok(());
+        }
+
+        // Nothing is being heard, so there is nothing to preserve and nothing to
+        // interrupt: the mix becomes the whole queue and plays from its own first
+        // track, seed included. Covers a restored session too, where a track is
+        // on screen but stopped.
+        let current = match self.queue.current() {
+            Some(item) if self.state != State::Stopped => item.clone(),
+            _ => {
+                // Explicit, not Random: a mix is a finite list the server chose,
+                // and refilling it with random tracks would dilute exactly the
+                // thing that was asked for.
+                self.queue.replace(mix, 0, Mode::Explicit);
+                return self.start_current().await;
+            }
+        };
+
+        // A track already handed to the sink will be heard whatever the queue
+        // says - rodio cannot take a queued source back - so the mix goes behind
+        // *it* rather than in its place, which is the same compromise QueueNext
+        // makes. PREQUEUE_LEAD keeps that to the last few seconds of a track.
+        let committed = self.queued_next.clone();
+        let keep_after = match committed {
+            Some(_) => self.queue.cursor() + 1,
+            None => self.queue.cursor(),
+        };
+
+        // The seed comes back first and is the track already playing, so keeping
+        // it would queue the same song twice over. Every copy of it, not just the
+        // first: a mix has no business replaying its own seed. The committed
+        // track goes the same way, since it is about to be heard regardless.
+        //
+        // Filtered on what is *actually* playing rather than on `seed_id`: if the
+        // track moved on while the request was in flight, the seed is now just
+        // another song and there is no reason to drop it.
+        let kept = [Some(current.id.as_str()), committed.as_deref()];
+        let mix: Vec<Item> = mix
+            .into_iter()
+            .filter(|item| !kept.contains(&Some(item.id.as_str())))
+            .collect();
+
+        // Nothing but the seed came back. Replacing the tail with an empty list
+        // would silently throw away whatever was queued, which is a worse outcome
+        // than the button appearing to do nothing - so say so and leave it alone.
+        if mix.is_empty() {
+            self.emit(Event::Notice(
+                "The mix came back with nothing new in it".into(),
+            ));
+            return Ok(());
+        }
+
+        let count = mix.len();
+        self.queue.replace_tail(keep_after, mix);
+        self.queue.mode = Mode::Explicit;
+
+        // The track that *was* next has been replaced, so the download started
+        // for it is no longer interesting and the tick loop has to reconsider.
+        // Left alone when something is committed: that track really is still next.
+        if self.queued_next.is_none() {
+            self.warming = None;
+        }
+
+        tracing::debug!(count, cursor = self.queue.cursor(), "queue rebuilt from an instant mix");
+        self.persist();
+        self.emit(Event::QueueChanged);
+        self.emit(Event::Notice(format!(
+            "Queue rebuilt, {} in the mix",
+            plural_tracks(count)
+        )));
+        Ok(())
     }
 
     /// Seeks the current track.
@@ -928,6 +1049,15 @@ impl Player {
                 tracing::debug!(%err, id, "prefetch download failed");
             }
         });
+    }
+}
+
+/// "1 track" / "N tracks", for a message the player builds itself.
+fn plural_tracks(count: usize) -> String {
+    if count == 1 {
+        "1 track".to_string()
+    } else {
+        format!("{count} tracks")
     }
 }
 

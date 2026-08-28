@@ -87,6 +87,12 @@ enum Query {
     ArtistAlbums(String),
     ArtistTracks(String),
     AlbumTracks(String),
+    /// The Library page's three server-ranked sections. Not keyed by their
+    /// limit: it is a constant, so a second key would only ever hold the same
+    /// value.
+    RecentAlbums,
+    MostPlayed,
+    RecentlyPlayed,
 }
 
 /// Most distinct queries kept at once.
@@ -173,6 +179,29 @@ impl Browser {
     pub fn artists(&self, cb: impl FnOnce(Result<Vec<Item>>) + 'static) {
         self.cached(Query::Artists, cb, |client| async move {
             client.artists().await
+        });
+    }
+
+    /// The Library page's three server-ranked destinations.
+    ///
+    /// One query each, run when the destination is actually opened rather than
+    /// when Library is: they are behind a row, so paying for all three on the
+    /// way to the artist list would be three round trips nobody asked for.
+    pub fn recent_albums(&self, limit: u32, cb: impl FnOnce(Result<Vec<Item>>) + 'static) {
+        self.cached(Query::RecentAlbums, cb, move |client| async move {
+            client.recent_albums(limit).await
+        });
+    }
+
+    pub fn most_played(&self, limit: u32, cb: impl FnOnce(Result<Vec<Item>>) + 'static) {
+        self.cached(Query::MostPlayed, cb, move |client| async move {
+            client.most_played_tracks(limit).await
+        });
+    }
+
+    pub fn recently_played(&self, limit: u32, cb: impl FnOnce(Result<Vec<Item>>) + 'static) {
+        self.cached(Query::RecentlyPlayed, cb, move |client| async move {
+            client.recently_played_tracks(limit).await
         });
     }
 

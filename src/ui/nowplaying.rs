@@ -73,6 +73,15 @@ const GLYPH_SIZE: i32 = 24;
 /// Play/pause, a fifth larger than the rest: it is the control that gets used.
 const PLAY_GLYPH_SIZE: i32 = 29;
 
+/// Instant mix, a little under the rest of the row.
+///
+/// Not a taste exception - it is a correction for the artwork, and the row looks
+/// uneven without it. Font Awesome's wand ink spans about 97% of its canvas where
+/// the ionicons glyphs beside it span about 87%, so at a shared `GLYPH_SIZE` it
+/// draws roughly a tenth larger than its neighbours while nominally matching
+/// them. 21 puts the *ink* back level with shuffle's.
+const MIX_GLYPH_SIZE: i32 = 21;
+
 /// Action row glyphs. Settings stays at the icon-theme default, being a utility
 /// button in a fixed square; Library and Queue are destinations and carry the
 /// row, so they get a fifth more.
@@ -129,6 +138,8 @@ pub struct NowPlaying {
     /// Same reason as `play_icon`: the repeat button's glyph changes with the
     /// setting, and it is the only indication of which state is in force.
     repeat_icon: gtk::Image,
+    /// Instant mix, kept because it is only usable with a track to seed from.
+    mix: gtk::Button,
     /// Current track, needed to resolve artist/album navigation targets.
     track: Rc<RefCell<Option<Item>>>,
     /// Position the user asked for, while the seek is still in flight. Position
@@ -241,6 +252,14 @@ impl NowPlaying {
         let random = icon_button("trayplay-shuffle-symbolic", "trayplay-random", GLYPH_SIZE);
         random.set_tooltip_text(Some("Random play"));
 
+        // Next to shuffle because it is the same kind of control - it replaces
+        // the queue with one nobody typed out - and the glyph says so, being
+        // shuffle's with a sparkle on it. Insensitive until there is a track to
+        // seed the mix from, which `set_track` maintains.
+        let mix = icon_button("trayplay-mix-symbolic", "trayplay-mix", MIX_GLYPH_SIZE);
+        mix.set_tooltip_text(Some("Instant mix from this track"));
+        mix.set_sensitive(false);
+
         // Balances shuffle on the other side of the transport. The glyph shows
         // the state that is in force, not what the next click would do, so a
         // plain forward arrow means "no repeat".
@@ -260,9 +279,19 @@ impl NowPlaying {
         buttons.append(&prev);
         buttons.append(&play_button);
         buttons.append(&next);
+        // Both queue-building buttons on the same side, in one box: a CenterBox
+        // keeps its centre child centred regardless of what the ends weigh, so
+        // play-pause does not move when this side grows.
+        let generators = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .build();
+        generators.append(&random);
+        generators.append(&mix);
+
         transport.set_center_widget(Some(&buttons));
         transport.set_start_widget(Some(&repeat));
-        transport.set_end_widget(Some(&random));
+        transport.set_end_widget(Some(&generators));
 
         // Icons rather than labels: the glyphs carry the meaning, and tooltips
         // keep them discoverable.
@@ -353,6 +382,7 @@ impl NowPlaying {
             play_button,
             play_icon,
             repeat_icon,
+            mix: mix.clone(),
             track: Rc::new(RefCell::new(None)),
             pin: Rc::new(Cell::new(None)),
             seek_generation: Rc::new(Cell::new(0)),
@@ -373,6 +403,7 @@ impl NowPlaying {
         this.wire(
             &prev, &next, &random, &repeat, &library, &queue, &settings, on_navigate,
         );
+        this.wire_mix();
         this
     }
 
@@ -523,6 +554,23 @@ impl NowPlaying {
             if pending.get() == generation {
                 player.send(Command::Seek(Duration::from_secs_f64(secs)));
             }
+        });
+    }
+
+    /// Separate from `wire` only because that one is already at clippy's
+    /// argument limit, and the mix button is the one whose handler needs the
+    /// current track rather than just the player.
+    fn wire_mix(self: &Rc<Self>) {
+        let player = self.session.player.clone();
+        let track = self.track.clone();
+        self.mix.connect_clicked(move |_| {
+            // Sensitivity already implies a track, but reading it back is the
+            // only way to know *which* - and a click can still land in the gap
+            // between a track ending and the button being greyed out again.
+            let Some(id) = track.borrow().as_ref().map(|item| item.id.clone()) else {
+                return;
+            };
+            player.send(Command::PlayInstantMix(id));
         });
     }
 
@@ -723,11 +771,13 @@ impl NowPlaying {
             self.root.remove_css_class("has-art");
             self.seek.set_sensitive(false);
             self.seek.set_value(0.0);
+            self.mix.set_sensitive(false);
             *self.track.borrow_mut() = None;
             return;
         };
 
         self.title.set_label(&item.name);
+        self.mix.set_sensitive(true);
 
         // Every credited artist, each linking to its own page. `display_artist`
         // is the fallback for a track the server gave no artist items for: it is

@@ -47,6 +47,18 @@ impl Queue {
         self.items.splice(at..at, items);
     }
 
+    /// Throws away everything after `keep_after` and puts `items` there instead,
+    /// leaving the cursor and the history behind it alone.
+    ///
+    /// What instant mix does: the queue *ahead* of the listener is replaced while
+    /// the track they are hearing keeps playing, so the cursor must not move and
+    /// what has already been played stays available to Previous.
+    pub fn replace_tail(&mut self, keep_after: usize, items: Vec<Item>) {
+        let at = (keep_after + 1).min(self.items.len());
+        self.items.truncate(at);
+        self.items.extend(items);
+    }
+
     /// Drops the track at the cursor, which [`Queue::remove`] refuses to touch.
     ///
     /// Only for a track that cannot be played at all - the caller is responsible
