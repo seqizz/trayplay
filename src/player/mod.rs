@@ -6,7 +6,7 @@ pub mod rodio_sink;
 pub mod sink;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -42,6 +42,15 @@ const MAX_MISSING_SKIPS: usize = 16;
 /// happens here is only a decoder build, and the gapless transition is
 /// unaffected.
 const PREQUEUE_LEAD: Duration = Duration::from_secs(10);
+
+/// How long a failed random refill is left alone before it is attempted again.
+///
+/// The refill is awaited by the actor, which answers nothing while it runs, and
+/// a queue that is running low stays running low when the refill fails - so with
+/// no backoff an unreachable server means one blocking attempt per tick, four a
+/// second, each of them up to the HTTP connect timeout. Play/pause and the queue
+/// page go unanswered for as long as that lasts.
+const REFILL_BACKOFF: Duration = Duration::from_secs(30);
 
 /// How many tracks an instant mix asks the server for.
 ///
@@ -250,6 +259,9 @@ pub struct Player {
     /// from `queued_next` because warming and queueing happen on different
     /// ticks: the file has to finish downloading before the decoder sees it.
     warming: Option<String>,
+    /// When a random refill may be attempted again, after one failed. None while
+    /// refills are healthy, which is every case but an unreachable server.
+    refill_after: Option<Instant>,
     events: broadcast::Sender<Event>,
 }
 
@@ -279,6 +291,7 @@ impl Player {
             resume_pending: false,
             queued_next: None,
             warming: None,
+            refill_after: None,
             events: events.clone(),
         };
 
@@ -811,13 +824,23 @@ impl Player {
         if self.queue.mode != Mode::Random || !self.queue.running_low(REFILL_SLACK) {
             return;
         }
+        // Nothing about the queue changes when a refill fails, so without this
+        // the next tick asks again immediately - and each attempt is a blocking
+        // await in the middle of the command loop. See REFILL_BACKOFF.
+        if self.refill_after.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
         match self.client.random_tracks(self.random_batch).await {
             Ok(more) => {
+                self.refill_after = None;
                 self.queue.append(more);
                 self.persist();
             }
             // A refill failure should not stop what is already queued.
-            Err(err) => tracing::warn!(%err, "random refill failed"),
+            Err(err) => {
+                self.refill_after = Some(Instant::now() + REFILL_BACKOFF);
+                tracing::warn!(%err, "random refill failed");
+            }
         }
     }
 
@@ -874,7 +897,26 @@ impl Player {
                     }
                     return Ok(());
                 }
-                Err(err) => return Err(err),
+                // Anything else is transient, so playback stops on this track
+                // rather than propagating the error.
+                //
+                // Returning Err leaves the state machine Playing with an empty
+                // sink, which the tick loop reads as end-of-track and answers
+                // with another `advance` - so a server that has gone away walks
+                // the cursor through the whole queue at four tracks a second,
+                // one toast each, and a restored session is gone by the time
+                // anyone looks. Stopping here keeps the cursor on the track that
+                // failed, and `resume_pending` makes Play retry *it* instead of
+                // starting a fresh random queue, which is what Play means from a
+                // stopped player otherwise.
+                Err(err) => {
+                    tracing::warn!(%err, id = %item.id, name = %item.name, "cannot start track");
+                    self.sink.stop();
+                    self.set_state(State::Stopped);
+                    self.resume_pending = true;
+                    self.emit(Event::Failed(format!("{err:#}")));
+                    return Ok(());
+                }
             };
             self.sink.play(reader).context("starting playback")?;
 

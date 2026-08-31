@@ -2,39 +2,43 @@
 
 A systray-focused Jellyfin music player for Linux.
 
-Features:
-- Jellyfin only, read-only: browse artists → albums → tracks, play, queue.
-- Random play that refills itself, or an album, or one artist's catalogue.
-- Queue that survives a restart, with add-to-queue and play-next from any row.
-- Repeat off / whole queue / one track, mirrored on MPRIS `LoopStatus`.
-- Gapless transitions, seeking, and a local track cache.
-- Works on X11 (native XEmbed tray) and Wayland (SNI, `gtk4-layer-shell`).
-- Themable through CSS with a documented, stable set of selectors (see
-  [THEMING.md](THEMING.md)).
+What:
 
-Not in scope:
+- Jellyfin only: Browse artists, albums, tracks, play, queue, repeat.
+- MPRIS support.
+- Random play that refills itself, or an album, or one artist's catalogue.
+- Server-side search over artists, albums and tracks, with some fuzziness.
+- Instant mix: Jellyfin's own "more like this" queued behind the current track.
+- Queue that survives a restart, with add-to-queue and play-next features.
+- Gapless transitions, seeking, and a local track cache.
+- Generated cover panel for tracks that have no art.
+- X11 (native XEmbed tray) and Wayland (SNI, `gtk4-layer-shell`) support.
+- Themable through CSS with a documented, stable set of selectors.
+
+What NOT:
+
 - Volume control (the system mixer owns volume)
 - Playlists
 - Library management
 - Any backend other than Jellyfin
 
+Further reading: **[DESIGN.md](DESIGN.md)** for how it behaves and why,
+**[THEMING.md](THEMING.md)** for the CSS contract, `CLAUDE.md` for the internals.
+
 ## Requirements
 
 - A Jellyfin server, and an account on it, duh.
-- GTK4 and libadwaita. On NixOS the flake handles this; elsewhere you need the
-  GTK4, libadwaita, `gtk4-layer-shell` and ALSA development packages.
-- For the popup to be *placed* on X11, a window manager rule: see
+- GTK4 and libadwaita. On NixOS the flake handles this; elsewhere you need the GTK4,
+  libadwaita, `gtk4-layer-shell` and ALSA development packages.
+- On X11, a window manager rule to place the popup: see
   [Running under X11](#running-under-x11).
-- Optional: a compositor with blur, if you want the translucent look to blur what
-  is behind it.
+- Optional: a compositor with blur, if you want better transparency.
 
-## Install
+## Run / Install
 
-```sh
-nix build && ./result/bin/trayplay
-```
+Since I am using NixOS, it's all dark magic. Feel free to build for your own distro. I'm not going to provide packages but you can find pre-built binaries under [releases](https://git.gurkan.in/gurkan/trayplay/releases) section for Linux.
 
-Or run it straight from the flake:
+If you have nix, you can test by running it straight from the flake:
 
 ```sh
 nix run 'git+https://git@git.gurkan.in/gurkan/trayplay.git'
@@ -47,38 +51,9 @@ trayplay login --server https://${SERVER_URL} --username ${USERNAME}
 trayplay dump-random --limit 20  # verifies auth and queries without the UI
 ```
 
-`--server`/`--username` fall back to `config.toml` when omitted.
+## Using it
 
-The access token lives in `$XDG_CONFIG_HOME/trayplay/credentials.toml`, mode `0600`
-in a `0700` directory; trayplay refuses to read it if the mode is looser than that.
-`device_id` beside it is a generated UUID identifying this install in Jellyfin's
-session list, deleting it just creates a new session entry.
-
-## Hints
-
-There is no separate search page, every list page filters as you type. On the
-Library page that filter goes to the server and searches artists, albums *and*
-tracks, so you can find a record without remembering who made it. Above the
-artist list that page carries three rows you can enter — **Recently added**,
-**Most played** and **Recently played** — each a list the server ranked. The last
-two are built from playback reports, so they need `report_playback` (on by
-default) and stay empty until something has been listened to.
-
-**Instant mix** is the button beside shuffle. It asks Jellyfin for tracks like the
-one playing now — its own similarity scoring over genres, artists and play
-history — and puts them in the queue *behind* it. The song you pressed it on keeps
-playing; only what comes next changes, and a toast confirms it, since nothing on
-screen otherwise would. Unlike random play the result is finite: it does not
-refill, so the mix stays a mix.
-
-**Queue** shows what the player is holding, with the current track marked; it
-updates live and is restored when trayplay starts again. Activating a row plays
-from that point. You can add whatever you want to the queue; either at the end or
-as next-to-play.
-
-Tracks with no cover art get a generated panel instead of an empty space: a colour
-derived from the album name, with that name tiled across it on an angle, drifting
-slowly. To reduce motion, see [Settings](#settings-page).
+Tries to be keyboard-first, with OK mouse support.
 
 ### Keyboard
 
@@ -89,7 +64,7 @@ Main window:
 | `Space` | Play/pause |
 | `n` / `p` | Next / previous track |
 | `←` / `→` | Seek back / forward 10% of the track |
-| `r` | Repeat: off → whole queue → this track → off |
+| `r` | Repeat: off, whole queue, this track, off |
 | `l` | Library |
 | `q` | Queue |
 | `s` | Settings |
@@ -97,9 +72,9 @@ Main window:
 | `A` | Focus the first artist |
 | `Ctrl`+`Q` | Quit |
 
-`A` focuses rather than navigating, because a track can credit several artists and
-picking one is the point. While an artist is focused the arrows move between artists
-instead of seeking, and `Enter` opens the focused one.
+`A` focuses rather than navigating, because a track can credit several artists and picking
+one is the point. While an artist is focused the arrows move between artists instead of
+seeking, and `Enter` opens the focused one.
 
 Anything with Ctrl or Alt is left to the window and the desktop, apart from Ctrl+Q.
 
@@ -113,17 +88,16 @@ On list pages (library, artist, album, queue):
 | `Shift`+`Enter` | The row's first menu entry: **Add to queue**, or **Remove from queue** on the queue page |
 | any text | Opens the filter bar and types into it; the arrows then move the caret |
 
+List pages also scroll by dragging, with a flick glide on release.
+
 ### Tray
 
 | Input | Action | X11 (XEmbed) | Wayland/KDE (SNI) |
 |---|---|---|---|
-| Left click | Show, raise, or hide the popup (see below) | yes | yes |
+| Left click | Show, raise, or hide the popup | yes | yes |
 | Middle click | Play/pause | yes | yes |
 | Scroll up / down | Next / previous track | yes | yes |
-| Right click | Context menu | no menu | yes (SNI `ContextMenu`) |
-
-Quit is **Ctrl+Q** on the popup window everywhere rather than a tray menu item:
-X11's tray icon has no menu to put one on.
+| Right click | Context menu | no menu, toggles the popup | yes (SNI `ContextMenu`) |
 
 ### MPRIS
 
@@ -136,63 +110,36 @@ playerctl -p trayplay play-pause / next / previous / position 30
 playerctl -p trayplay loop Track|Playlist|None
 ```
 
-Transport, metadata and `LoopStatus`. `Volume` is absent (the system mixer owns
-volume), and so is `Shuffle`: random play here is a way of *building* a queue rather
-than a switch on an existing one, so there would be nothing to toggle. `LoopStatus`
-is the same setting as the repeat button (`Playlist` = repeat the queue, `Track` =
-repeat this track), so changing either updates the other. `Raise` shows the popup,
-`Quit` exits.
-
 ## Configuration
 
-`$XDG_CONFIG_HOME/trayplay/config.toml`, all keys optional:
+`$XDG_CONFIG_HOME/trayplay/config.toml`, hand-edited, never written by trayplay. All keys
+are optional:
 
 ```toml
-server             = "https://jellyfin.example.org"
-username           = "you"
-anchor             = "top-right"   # top-left|top-right|bottom-left|bottom-right
-margin             = 8
-width              = 380
-height             = 520
-hide_on_focus_loss = false         # initial value only; the settings page owns it
-hide_delay_ms      = 0             # wait this long after losing focus before hiding
-x11_window_type    = "utility"     # X11 only; this is the default
-random_batch       = 100
-cache_max_mb       = 500           # initial value only; the settings page owns it
-prefetch_next      = true
-library_cache_ttl_secs = 300       # reuse a browse query for this long; 0 disables
-report_playback    = true          # tell the server what is played
+server                  = "https://jellyfin.example.org"
+username                = "you"
+width                   = 380
+height                  = 520
+hide_on_focus_loss      = false         # initial value only; the settings page owns it
+hide_delay_ms           = 0             # wait this long after losing focus before hiding
+random_batch            = 100
+cache_max_mb            = 500           # initial value only; the settings page owns it
+prefetch_next           = true
+library_cache_ttl_secs  = 300           # reuse a browse query for this long; 0 disables
+report_playback         = true          # tell the server what is played
+# This one is X11-only
+x11_window_type         = "utility"     # This is the default
+# Below are Wayland-only
+anchor                  = "top-right"   # top-left|top-right|bottom-left|bottom-right
+margin                  = 8
 ```
 
-`report_playback` is what gives the server play counts, "last played" dates and a
-Now Playing entry in its dashboard — and with them the Library page's "Most
-played" and "Recently played" lists, which are built from that same data and stay
-empty without it. Set it to `false` to keep listening off the server's
-record.
-
-`anchor` and `margin` only take effect under Wayland/layer-shell. On X11 the window
-manager decides placement (see below).
-
-`x11_window_type` sets `_NET_WM_WINDOW_TYPE` on the popup (the EWMH name without its
-`_NET_WM_WINDOW_TYPE_` prefix). It defaults to **`utility`**, which is what this window is
-by EWMH's own definition (a persistent auxiliary window, not a document window), and it
-keeps window manager and compositor rules written for ordinary windows from applying to
-it. GTK4 removed `set_type_hint` with no replacement, so trayplay sets the property itself,
-before the window is first mapped. Set `"normal"` for GTK's own behaviour.
-
-`hide_delay_ms` is a trade rather than an improvement, which is why it defaults to 0
-(hide on the next main-loop turn). A delay swallows focus that bounces straight back,
-but whatever the window manager and compositor do with a window that is about to
-disappear (restacking it, fading it, re-redirecting the screen around a fullscreen
-window) then happens in plain sight for that long. If the popup looks like it flashes
-or jumps as it hides, that is the compositor, not the delay: with picom, try
-`unredir-if-possible = false` or `fade-exclude = [ "class_g = 'trayplay'" ]`.
+See [DESIGN.md](DESIGN.md) for details of how all of these work.
 
 ### Settings page
 
-What the popup's own settings page changes is written to
-`$XDG_STATE_HOME/trayplay/settings.toml`, never to `config.toml`: a hand-edited file
-should not be rewritten by a switch.
+The popup's own settings page writes to `$XDG_STATE_HOME/trayplay/settings.toml`, which
+overrides `config.toml`:
 
 ```toml
 color_scheme       = "dark"    # light|dark; absent means follow the desktop
@@ -202,26 +149,10 @@ cache_max_mb       = 500       # absent means take config.toml's value
 repeat             = "off"     # off|all|one
 ```
 
-**Dark mode** starts out matching the desktop. Flipping it forces the choice from
-then on, so a night-light schedule cannot flip the popup back. Delete the key to
-follow the desktop again if you don't know what you want.
-
-**Reduce motion** holds the no-art panel still. The panel is still drawn, this is
-about movement.
-
-**Auto-hide when unfocused** closes the popup as soon as it loses focus. Off by
-default, because under focus-follows-mouse it would close every time the pointer
-crossed the window.
-
-**Cache limit** caps `$XDG_CACHE_HOME/trayplay/`, in megabytes, and the row shows how
-much is in use. Lowering it prunes immediately rather than waiting for the next
-download; entries go oldest-download-first. 500 MB by default.
-
 ## Running under X11
 
-The tray icon docks natively, no bridge process but GTK4 removed window
-positioning on X11, so the window manager places the popup. trayplay sets a stable
-`WM_CLASS` of `trayplay` to match on. For AwesomeWM:
+The tray icon docks natively, no bridge process. Placement is the window manager's job,
+and trayplay sets a stable `WM_CLASS` of `trayplay` to match on. For AwesomeWM:
 
 ```lua
 -- rc.lua
@@ -241,55 +172,30 @@ ruled.client.append_rule {
 }
 ```
 
-Do not raise, unminimise or otherwise poke the window from the window manager side:
-running `trayplay` again is the supported way to reach a running instance. The second
-process hands off over D-Bus and the popup toggles exactly as a tray click does (show,
-raise if it is up but unfocused, hide if it has focus). Raising the client by hand tends
-to clear properties the rule above sets, and since the window is unmanaged on every hide,
-nothing restores them.
+Do not raise, unminimise or otherwise poke the window from the window manager side.
+Running `trayplay` again is the supported way to reach a running instance: the second
+process hands off over D-Bus and the popup toggles exactly as a tray click does.
 
 Under Wayland none of this is needed: the tray is native SNI and the popup is a
-`gtk4-layer-shell` surface anchored per the `anchor` config key.
+`gtk4-layer-shell` surface anchored per the `anchor` key.
 
 ## Theming
 
 CSS only, with a stable set of selectors and hot reload from
-`$XDG_CONFIG_HOME/trayplay/theme.css`. See **[THEMING.md](THEMING.md)** for the
-selector contract, the transparency/blur setup, and the handful of properties that
-must be left alone because they are animated in code.
-
-## How playback works
-
-Tracks are downloaded to `$XDG_CACHE_HOME/trayplay/` before being decoded rather
-than streamed straight into the decoder: decoders probe by seeking, and a seek past
-the download head fails. The cost is a short wait before the first track; the next
-one is prefetched while the current plays, so transitions stay gapless.
-The cache is bounded by the limit in Settings (500 MB by default) and pruned
-oldest-download-first, both at startup and after every completed download.
-
-flac, mp3, m4a/aac, alac and wav are decoded locally. Everything else (Opus, WMA,
-APE, DSD, whatever) is transcoded by the server, because playback goes through
-`/Audio/<id>/universal` with a container whitelist rather than `/stream?static=true`.
-Ogg is deliberately not on the direct-play list: it usually carries Opus, which the
-decoder cannot handle, and a container name cannot tell Opus from Vorbis.
+`$XDG_CONFIG_HOME/trayplay/theme.css`. See **[THEMING.md](THEMING.md)** for the selector
+contract, the transparency and blur setup, and the handful of properties that must be left
+alone because they are animated in code.
 
 ## Icons and fonts
 
-Transport and action icons come from [ionicons](https://github.com/ionic-team/ionicons),
-[Phosphor](https://github.com/phosphor-icons/core) and
-[Qlementine](https://github.com/oclero/qlementine-icons) (all MIT) plus one MynaUI
-icon. They live in `data/icons/scalable/actions/`, renamed to `trayplay-*-symbolic`
-so they neither shadow icon theme names nor lose GTK's symbolic recolouring; each set
-keeps its own `LICENSE` and a `SOURCES.md` mapping every file to its upstream name.
-`build.rs` compiles them into a GResource bundle. To add one: drop the file in, add a
-line to `data/icons/trayplay.gresource.xml`, and refer to it by name.
-
-Fonts are a drop-in directory: put `.ttf`/`.otf`/`.ttc` files in `data/fonts/` and
-they are compiled in on the next build, with the family name read out of the font
-itself. They are used by the no-art panel, one per album. Empty is fine and is the
-default; everything already bundled there uses SIL OFL 1.1. See `data/fonts/README.md`.
+Icons come from [ionicons](https://github.com/ionic-team/ionicons),
+[Phosphor](https://github.com/phosphor-icons/core),
+[Qlementine](https://github.com/oclero/qlementine-icons), one MynaUI icon (all MIT) and
+one Font Awesome 4 icon (OFL), compiled into a GResource bundle at build time. Fonts are a
+drop-in directory: anything in `data/fonts/` is compiled in on the next build and used by
+the no-art panel. Both are described in [DESIGN.md](DESIGN.md).
 
 ## Licence
 
-Anything declared above as MIT is MIT, fonts are SIL OFL 1.1, and everything else is
-WTFPL, see [LICENSE](LICENSE).
+Anything declared above as MIT is MIT, fonts and Font Awesome 4 are SIL OFL 1.1, and
+everything else is WTFPL, see [LICENSE](LICENSE).

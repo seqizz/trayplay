@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -5,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use super::auth::{device_id, Credentials};
-use super::models::{self, AuthResponse, Item, ItemsResponse};
+use super::models::{self, AuthResponse, Item, ItemsResponse, Kind};
 
 const CLIENT_NAME: &str = "trayplay";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -176,20 +177,75 @@ impl Client {
         Ok(resp.items)
     }
 
-    /// Mixed-type search across tracks, albums and artists.
+    /// Mixed-type search across artists, albums and tracks.
     ///
     /// Backs the Library page's filter: an artist name alone is covered by the
     /// loaded artist list, but finding an album or a track by name needs the
     /// server, so the whole filter goes through here instead of a client-side
     /// contains-match.
+    ///
+    /// **Two endpoints, and both are needed.** `/Items` does not answer for
+    /// artists whatever `includeItemTypes` says: a `MusicArtist` is not a child
+    /// of a library folder, so a recursive query never reaches one. And its
+    /// `searchTerm` matches item *names*, not performer credits, so an artist's
+    /// name matches neither their albums nor their tracks either. `/Items` alone
+    /// therefore answered an artist name - which is most of what a filter box
+    /// gets typed into it - with nothing at all, for an artist plainly sitting
+    /// in the unfiltered list right behind the box.
     pub async fn search(&self, term: &str, limit: u32) -> Result<Vec<Item>> {
+        // Both halves are attempted even if one fails, and only a total failure
+        // is reported: the artist query is the newer of the two, and a server
+        // that dislikes it must not take album and track search down with it.
+        let (artists, items) =
+            tokio::join!(self.search_artists(term, limit), self.search_items(term, limit));
+
+        let items = match (artists, items) {
+            (Ok(artists), Ok(items)) => merge_search(artists, items),
+            (Err(err), Ok(items)) => {
+                tracing::warn!(error = %err, "artist search failed, showing albums and tracks only");
+                merge_search(Vec::new(), items)
+            }
+            (Ok(artists), Err(err)) => {
+                tracing::warn!(error = %err, "album/track search failed, showing artists only");
+                merge_search(artists, Vec::new())
+            }
+            // The `/Items` error, not the artist one: it is the half that has
+            // always worked, so its failure is the more informative message.
+            (Err(_), Err(err)) => return Err(err),
+        };
+
+        let mut items = items;
+        items.truncate(limit as usize);
+        Ok(items)
+    }
+
+    /// Artist half of `search`. `/Artists` is the only endpoint that lists
+    /// `MusicArtist` items at all - see `search`.
+    async fn search_artists(&self, term: &str, limit: u32) -> Result<Vec<Item>> {
+        let resp: ItemsResponse = self
+            .get_json(
+                "/Artists",
+                &[
+                    ("userId", self.user_id()?.to_string()),
+                    ("searchTerm", term.to_string()),
+                    ("limit", limit.to_string()),
+                    ("sortBy", "SortName".into()),
+                    ("enableTotalRecordCount", "false".into()),
+                ],
+            )
+            .await?;
+        Ok(resp.items)
+    }
+
+    /// Album and track half of `search`.
+    async fn search_items(&self, term: &str, limit: u32) -> Result<Vec<Item>> {
         let resp: ItemsResponse = self
             .get_json(
                 "/Items",
                 &[
                     ("userId", self.user_id()?.to_string()),
                     ("searchTerm", term.to_string()),
-                    ("includeItemTypes", "MusicArtist,MusicAlbum,Audio".into()),
+                    ("includeItemTypes", "MusicAlbum,Audio".into()),
                     ("recursive", "true".into()),
                     ("limit", limit.to_string()),
                     // ArtistItems is not a default BaseItemDto field: without
@@ -473,6 +529,27 @@ impl Client {
             urlencoding::encode(tag)
         )
     }
+}
+
+/// Orders `search`'s two result sets into one list: artists, then albums, then
+/// tracks.
+///
+/// A typed name is most likely to be the name of the narrowest thing it matches,
+/// and `/Items` returns its two types interleaved by the server's own sort, so
+/// the split has to be made here rather than relying on the reply's order. Ids
+/// are deduplicated because the two queries would overlap on a server that does
+/// return artists from `/Items`; first occurrence wins, which keeps this order.
+fn merge_search(artists: Vec<Item>, items: Vec<Item>) -> Vec<Item> {
+    let (albums, tracks): (Vec<Item>, Vec<Item>) =
+        items.into_iter().partition(|item| item.kind() == Kind::Album);
+
+    let mut out = artists;
+    out.extend(albums);
+    out.extend(tracks);
+
+    let mut seen = HashSet::new();
+    out.retain(|item| seen.insert(item.id.clone()));
+    out
 }
 
 /// Hostname for the Device field. Read straight from procfs to avoid pulling a
