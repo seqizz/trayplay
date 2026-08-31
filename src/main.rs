@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod fonts;
+mod fuzzy;
 mod icons;
 mod jellyfin;
 mod mpris;

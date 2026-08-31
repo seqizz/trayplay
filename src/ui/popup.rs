@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -473,17 +474,22 @@ fn push_artists(nav: &adw::NavigationView, session: &Session) {
                 let browser = session_query.browser.clone();
                 let session_search = session_query.clone();
                 let nav_weak = nav_for_query.clone();
+                let loaded_artists = artists_for_query.clone();
                 glib::timeout_add_local_once(LIBRARY_SEARCH_DEBOUNCE, move || {
                     if generation.get() != gen {
                         return;
                     }
+                    let term = text.clone();
                     browser.search(&text, LIBRARY_SEARCH_LIMIT, move |result| {
                         if generation.get() != gen {
                             return;
                         }
                         let Some(nav) = nav_weak.upgrade() else { return };
                         match result {
-                            Ok(items) => render(vec![search_section(items, &nav, &session_search)]),
+                            Ok(items) => {
+                                let items = with_fuzzy_artists(items, &loaded_artists, &term);
+                                render(vec![search_section(items, &nav, &session_search)])
+                            }
                             // Toast, not a page: the search page stays up with
                             // its current rows, so the next keystroke can retry.
                             Err(err) => toast_error("Search", &err),
@@ -493,6 +499,48 @@ fn push_artists(nav: &adw::NavigationView, session: &Session) {
             }
         });
     });
+}
+
+/// Fuzzy artist rows appended to a Library search, at most.
+///
+/// A one-edit budget is narrow enough that a real library rarely produces more
+/// than a handful, so this is a guard against a pathological term rather than a
+/// page-size decision.
+const FUZZY_ARTIST_LIMIT: usize = 12;
+
+/// Appends artists within one edit of `term` to the server's own results.
+///
+/// The artist list is the one thing the Library page has in full (it is what an
+/// empty filter box shows), so it is the one thing that can be matched without
+/// asking the server - which is why typo tolerance stops at artists and albums
+/// and tracks are exact. See `crate::fuzzy` for the budget and why it is not a
+/// similarity score.
+///
+/// Appended rather than merged in by score, and deduplicated against what the
+/// server returned: an exactly-matching name must not be pushed down the page by
+/// a guess, so everything the server was sure about comes first and the guesses
+/// follow in order of how close they are.
+fn with_fuzzy_artists(mut items: Vec<Item>, artists: &[Item], term: &str) -> Vec<Item> {
+    let seen: HashSet<&str> = items.iter().map(|item| item.id.as_str()).collect();
+
+    let mut fuzzy: Vec<(u8, &Item)> = artists
+        .iter()
+        .filter(|artist| !seen.contains(artist.id.as_str()))
+        .filter_map(|artist| {
+            crate::fuzzy::prefix_distance(term, &artist.name).map(|distance| (distance, artist))
+        })
+        .collect();
+
+    // Closest first, then by name so the order of equally-close guesses is
+    // stable rather than whatever the artist list happened to be sorted by.
+    fuzzy.sort_by(|(a_dist, a), (b_dist, b)| a_dist.cmp(b_dist).then_with(|| a.name.cmp(&b.name)));
+    items.extend(
+        fuzzy
+            .into_iter()
+            .take(FUZZY_ARTIST_LIMIT)
+            .map(|(_, artist)| artist.clone()),
+    );
+    items
 }
 
 /// Drops a pending page whose query failed, leaving the toast to explain why.

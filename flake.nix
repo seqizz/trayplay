@@ -11,8 +11,16 @@
     crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      rust-overlay,
+      crane,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = import nixpkgs {
           inherit system;
@@ -50,9 +58,9 @@
         src = pkgs.lib.cleanSourceWith {
           src = ./.;
           name = "trayplay-source";
-          filter = path: type:
-            (craneLib.filterCargoSources path type)
-            || (builtins.match ".*/data(/.*)?" path != null);
+          filter =
+            path: type:
+            (craneLib.filterCargoSources path type) || (builtins.match ".*/data(/.*)?" path != null);
         };
 
         commonArgs = {
@@ -64,48 +72,51 @@
         # Separate dep-only derivation so source edits do not rebuild the world.
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        trayplay = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
+        trayplay = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
 
-          postInstall = ''
-            install -Dm644 data/trayplay.svg \
-              $out/share/icons/hicolor/scalable/apps/trayplay.svg
-            install -Dm644 data/trayplay.desktop \
-              $out/share/applications/trayplay.desktop
-            install -Dm644 data/default.css $out/share/trayplay/default.css
+            postInstall = ''
+              install -Dm644 data/trayplay.svg \
+                $out/share/icons/hicolor/scalable/apps/trayplay.svg
+              install -Dm644 data/trayplay.desktop \
+                $out/share/applications/trayplay.desktop
+              install -Dm644 data/default.css $out/share/trayplay/default.css
 
-            # Icons and fonts are compiled *into* the binary, so their notices
-            # have to travel with the package rather than with any installed
-            # asset - there is no installed asset to attach them to.
-            install -Dm644 data/icons/ionicons/LICENSE \
-              $out/share/licenses/trayplay/ionicons-LICENSE
-            install -Dm644 data/icons/phosphor/LICENSE \
-              $out/share/licenses/trayplay/phosphor-LICENSE
-            install -Dm644 data/icons/qlementine/LICENSE \
-              $out/share/licenses/trayplay/qlementine-LICENSE
-            install -Dm644 data/icons/fontawesome/LICENSE \
-              $out/share/licenses/trayplay/fontawesome-LICENSE
-            # MynaUI's terms (MIT, no attribution required) were never in hand as
-            # upstream text, so its SOURCES.md is the record - see CLAUDE.md.
-            install -Dm644 data/icons/mynaui/SOURCES.md \
-              $out/share/licenses/trayplay/mynaui-NOTICE.md
-            # Guarded rather than assumed: data/fonts is a drop-in directory and
-            # may legitimately be empty, in which case no font is embedded and
-            # there is nothing to license.
-            if [ -f data/fonts/OFL.txt ]; then
-              install -Dm644 data/fonts/OFL.txt \
-                $out/share/licenses/trayplay/fonts-OFL.txt
-              install -Dm644 data/fonts/README.md \
-                $out/share/licenses/trayplay/fonts-NOTICE.md
-            fi
-          '';
+              # Icons and fonts are compiled *into* the binary, so their notices
+              # have to travel with the package rather than with any installed
+              # asset - there is no installed asset to attach them to.
+              install -Dm644 data/icons/ionicons/LICENSE \
+                $out/share/licenses/trayplay/ionicons-LICENSE
+              install -Dm644 data/icons/phosphor/LICENSE \
+                $out/share/licenses/trayplay/phosphor-LICENSE
+              install -Dm644 data/icons/qlementine/LICENSE \
+                $out/share/licenses/trayplay/qlementine-LICENSE
+              install -Dm644 data/icons/fontawesome/LICENSE \
+                $out/share/licenses/trayplay/fontawesome-LICENSE
+              # MynaUI's terms (MIT, no attribution required) were never in hand as
+              # upstream text, so its SOURCES.md is the record - see CLAUDE.md.
+              install -Dm644 data/icons/mynaui/SOURCES.md \
+                $out/share/licenses/trayplay/mynaui-NOTICE.md
+              # Guarded rather than assumed: data/fonts is a drop-in directory and
+              # may legitimately be empty, in which case no font is embedded and
+              # there is nothing to license.
+              if [ -f data/fonts/OFL.txt ]; then
+                install -Dm644 data/fonts/OFL.txt \
+                  $out/share/licenses/trayplay/fonts-OFL.txt
+                install -Dm644 data/fonts/README.md \
+                  $out/share/licenses/trayplay/fonts-NOTICE.md
+              fi
+            '';
 
-          meta = with pkgs.lib; {
-            description = "Systray Jellyfin music player with MPRIS support";
-            mainProgram = "trayplay";
-            platforms = platforms.linux;
-          };
-        });
+            meta = with pkgs.lib; {
+              description = "Systray Jellyfin music player with MPRIS support";
+              mainProgram = "trayplay";
+              platforms = platforms.linux;
+            };
+          }
+        );
 
         # Version the release artifacts are named after. Read from Cargo.toml so
         # the tag, the tarball and `trayplay --version` cannot disagree.
@@ -115,18 +126,23 @@
         # attachment carries. Contents are exactly `trayplay`'s $out, so an
         # unpacked tarball has bin/, share/applications, share/licenses and the
         # rest in the places `prebuilt` expects them.
-        releaseTarball = pkgs.runCommand
-          "trayplay-${version}-${system}.tar.gz"
-          { nativeBuildInputs = [ pkgs.gnutar pkgs.gzip ]; }
-          ''
-            # Dereferenced: $out/bin/trayplay is a wrapper script next to
-            # .trayplay-wrapped, and both are real files, but share/ can hold
-            # symlinks into the store that would be dangling once unpacked
-            # elsewhere.
-            tar --dereference --owner=0 --group=0 --numeric-owner \
-              --sort=name --mtime='@1' \
-              -czf $out -C ${trayplay} .
-          '';
+        releaseTarball =
+          pkgs.runCommand "trayplay-${version}-${system}.tar.gz"
+            {
+              nativeBuildInputs = [
+                pkgs.gnutar
+                pkgs.gzip
+              ];
+            }
+            ''
+              # Dereferenced: $out/bin/trayplay is a wrapper script next to
+              # .trayplay-wrapped, and both are real files, but share/ can hold
+              # symlinks into the store that would be dangling once unpacked
+              # elsewhere.
+              tar --dereference --owner=0 --group=0 --numeric-owner \
+                --sort=name --mtime='@1' \
+                -czf $out -C ${trayplay} .
+            '';
 
         # `nix run .#bump -- patch|minor|major|X.Y.Z`
         #
@@ -144,7 +160,10 @@
           name = "trayplay-bump";
           # cargo is what rewrites Cargo.lock; letting it do that is safer than
           # sed on a file whose format is cargo's business.
-          runtimeInputs = [ pkgs.git toolchain ];
+          runtimeInputs = [
+            pkgs.git
+            toolchain
+          ];
           text = ''
             usage() {
               cat >&2 <<'EOF'
@@ -303,6 +322,9 @@
           "0.3.2" = {
             x86_64-linux = "sha256-VaSdBkOzpI6L8N791sO8/oRuK8OPYLcYCD04gD2xYI0=";
           };
+          "0.4.0" = {
+            x86_64-linux = "sha256-Dl8j89d3+MIaBIJJ4gTxE9PgUSr186S0aAqzaTuMJyY=";
+          };
         };
 
         # Installs the binary from a Forgejo release instead of building it.
@@ -321,55 +343,65 @@
         # system. Reported by a derivation that fails when *built* rather than by
         # a throw while evaluating: a throw would make `nix flake check` fail on a
         # flake that is perfectly fine, just not released yet.
-        prebuilt = if pinnedHash == "" then
-          pkgs.runCommand "trayplay-bin-unavailable" { } ''
-            echo "No prebuilt trayplay ${version} for ${system}: no hash for that" >&2
-            echo "version in flake.nix's prebuiltHashes - either it has not been" >&2
-            echo "released yet, or the entry is missing. Build from source" >&2
-            echo "instead:  nix build .#trayplay" >&2
-            exit 1
-          ''
-        else pkgs.stdenv.mkDerivation {
-          pname = "trayplay-bin";
-          inherit version;
+        prebuilt =
+          if pinnedHash == "" then
+            pkgs.runCommand "trayplay-bin-unavailable" { } ''
+              echo "No prebuilt trayplay ${version} for ${system}: no hash for that" >&2
+              echo "version in flake.nix's prebuiltHashes - either it has not been" >&2
+              echo "released yet, or the entry is missing. Build from source" >&2
+              echo "instead:  nix build .#trayplay" >&2
+              exit 1
+            ''
+          else
+            pkgs.stdenv.mkDerivation {
+              pname = "trayplay-bin";
+              inherit version;
 
-          src = pkgs.fetchurl {
-            url = "${releaseBaseUrl}/trayplay-${version}-${system}.tar.gz";
-            hash = pinnedHash;
-          };
+              src = pkgs.fetchurl {
+                url = "${releaseBaseUrl}/trayplay-${version}-${system}.tar.gz";
+                hash = pinnedHash;
+              };
 
-          sourceRoot = ".";
+              sourceRoot = ".";
 
-          nativeBuildInputs = with pkgs; [ autoPatchelfHook wrapGAppsHook4 ];
-          # The same set the source build links against: autoPatchelf resolves
-          # against these, and wrapGAppsHook4 needs them for XDG_DATA_DIRS.
-          inherit buildInputs;
+              nativeBuildInputs = with pkgs; [
+                autoPatchelfHook
+                wrapGAppsHook4
+              ];
+              # The same set the source build links against: autoPatchelf resolves
+              # against these, and wrapGAppsHook4 needs them for XDG_DATA_DIRS.
+              inherit buildInputs;
 
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out
-            cp -r ./* $out/
-            runHook postInstall
-          '';
+              installPhase = ''
+                runHook preInstall
+                mkdir -p $out
+                cp -r ./* $out/
+                runHook postInstall
+              '';
 
-          # The tarball carries the builder's own wrapper script, whose paths point
-          # into a store this machine may not have. Dropped so wrapGAppsHook4 can
-          # write a fresh one around the real binary.
-          preFixup = ''
-            if [ -e $out/bin/.trayplay-wrapped ]; then
-              mv $out/bin/.trayplay-wrapped $out/bin/trayplay
-            fi
-          '';
+              # The tarball carries the builder's own wrapper script, whose paths point
+              # into a store this machine may not have. Dropped so wrapGAppsHook4 can
+              # write a fresh one around the real binary.
+              preFixup = ''
+                if [ -e $out/bin/.trayplay-wrapped ]; then
+                  mv $out/bin/.trayplay-wrapped $out/bin/trayplay
+                fi
+              '';
 
-          meta = trayplay.meta // {
-            description = "${trayplay.meta.description} (prebuilt release binary)";
-          };
-        };
+              meta = trayplay.meta // {
+                description = "${trayplay.meta.description} (prebuilt release binary)";
+              };
+            };
       in
       {
         packages = {
           default = trayplay;
-          inherit trayplay prebuilt releaseTarball bump;
+          inherit
+            trayplay
+            prebuilt
+            releaseTarball
+            bump
+            ;
         };
 
         apps = {
@@ -416,10 +448,14 @@
         # because that catches mistakes rather than style.
         checks = {
           inherit trayplay;
-          clippy = craneLib.cargoClippy (commonArgs // {
-            inherit cargoArtifacts;
-            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-          });
+          clippy = craneLib.cargoClippy (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+            }
+          );
         };
-      });
+      }
+    );
 }
