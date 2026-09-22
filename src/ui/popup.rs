@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -19,6 +19,13 @@ use super::Session;
 /// How long a playback error stays on screen. Long enough to read a sentence,
 /// short enough that it is gone by the next interaction.
 const TOAST_TIMEOUT_SECS: u32 = 5;
+
+/// Width the banner wraps at, in characters.
+///
+/// The popup defaults to 380px, and inside a `gtk::Overlay` a label is given
+/// its full natural width, so `wrap` never triggers on its own; the explicit
+/// max is what forces the text onto more lines instead of overflowing.
+const BANNER_MAX_WIDTH_CHARS: i32 = 32;
 
 /// How long a hide waits while a row menu is open before looking again.
 ///
@@ -1236,21 +1243,74 @@ thread_local! {
 }
 
 /// Transient error banner stacked over the whole window.
+///
+/// This was `adw::ToastOverlay` + `adw::Toast` until the messages proved too
+/// long for it: AdwToast's title is a single-line ellipsized label with no
+/// wrap property and no public hook to add one, so the text got cut off at the
+/// popup's narrow width with nothing a theme could do about it. The queueing
+/// and dedupe ToastOverlay did internally now live in `queue` / `showing`.
 struct Toaster {
-    overlay: adw::ToastOverlay,
+    /// Stable selector root for themes; the banner itself is `.trayplay-banner`.
+    overlay: gtk::Overlay,
+    label: gtk::Label,
+    revealer: gtk::Revealer,
     /// The message currently on screen, so a repeat can be suppressed.
     showing: RefCell<Option<String>>,
+    /// Messages waiting for the one on screen to time out. FIFO, because a
+    /// burst of skip failures shows one per message, in order.
+    queue: RefCell<VecDeque<String>>,
+    /// Bumped by every `advance`, so an auto-hide timer left over from a
+    /// message that was already replaced wakes up, sees a stale generation and
+    /// exits instead of hiding its replacement. A generation counter rather
+    /// than a stored `SourceId`, because that id would have to be removed from
+    /// inside its own dispatch when the timer fires.
+    timer_gen: Cell<u64>,
 }
 
 impl Toaster {
     fn new(child: &adw::NavigationView) -> Rc<Self> {
-        let overlay = adw::ToastOverlay::new();
+        // WordChar so a long token (URL, transport error text) breaks too;
+        // plain Word would leave a token wider than the label overflowing.
+        let label = gtk::Label::builder()
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .justify(gtk::Justification::Center)
+            .max_width_chars(BANNER_MAX_WIDTH_CHARS)
+            .build();
+
+        // The box exists so CSS owns the banner's look (background, padding,
+        // rounded corners) the way `.toast` used to provide it for free.
+        let banner = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        banner.add_css_class("trayplay-banner");
+        banner.append(&label);
+
+        let revealer = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::Crossfade)
+            .transition_duration(150)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::End)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(12)
+            .reveal_child(false)
+            .build();
+        revealer.set_child(Some(&banner));
+
+        let overlay = gtk::Overlay::new();
         // Stable selector root for themes.
         overlay.set_widget_name("trayplay-toast");
         overlay.set_child(Some(child));
+        overlay.add_overlay(&revealer);
+
         let toaster = Rc::new(Self {
             overlay,
+            label,
+            revealer,
             showing: RefCell::new(None),
+            queue: RefCell::new(VecDeque::new()),
+            timer_gen: Cell::new(0),
         });
         TOASTER.with(|slot| *slot.borrow_mut() = Some(toaster.clone()));
         toaster
@@ -1259,33 +1319,58 @@ impl Toaster {
     /// Shows `message`, ignoring it while an identical one is still visible.
     ///
     /// Failures arrive in bursts - a seek on an unseekable track emits one per
-    /// attempt, and a queue of unplayable tracks emits one per skip - and
-    /// ToastOverlay shows them strictly one at a time, so without this the same
-    /// sentence would replay for half a minute.
+    /// attempt, and a queue of unplayable tracks emits one per skip - and the
+    /// banner shows strictly one at a time, so without this the same sentence
+    /// would replay for half a minute.
     fn show(self: &Rc<Self>, message: String) {
         if self.showing.borrow().as_deref() == Some(message.as_str()) {
             return;
         }
 
-        let toast = adw::Toast::builder()
-            .title(&message)
-            .timeout(TOAST_TIMEOUT_SECS)
-            .build();
-        // Error strings are plain text and can contain angle brackets from a
-        // transport error, which Pango would reject as bad markup.
-        toast.set_use_markup(false);
+        self.queue.borrow_mut().push_back(message);
+        // With a banner on screen, its own timer calls `advance`; starting one
+        // here as well would only hide the message being read.
+        if self.showing.borrow().is_none() {
+            self.advance();
+        }
+    }
 
-        // Weak, or the toast's own handler would keep the Toaster alive through
-        // the closure it holds.
-        let weak = Rc::downgrade(self);
-        toast.connect_dismissed(move |_| {
-            if let Some(this) = weak.upgrade() {
-                this.showing.replace(None);
+    /// Shows the queue's next message, or hides the banner when the queue is
+    /// empty. Called from `show` and from the previous message's timer.
+    fn advance(self: &Rc<Self>) {
+        // Invalidates any timer still pending from a message before this one.
+        self.timer_gen.set(self.timer_gen.get().wrapping_add(1));
+
+        let message = self.queue.borrow_mut().pop_front();
+        match message {
+            Some(message) => {
+                // `set_text`, not markup: error strings are plain text and can
+                // contain angle brackets from a transport error, which Pango
+                // would reject as bad markup.
+                self.label.set_text(&message);
+                self.revealer.set_reveal_child(true);
+                self.showing.replace(Some(message));
+
+                let gen = self.timer_gen.get();
+                // Weak, or the timer's closure would keep the Toaster alive
+                // through a widget nothing else references.
+                let weak = Rc::downgrade(self);
+                glib::timeout_add_seconds_local(TOAST_TIMEOUT_SECS, move || {
+                    let Some(this) = weak.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    if this.timer_gen.get() != gen {
+                        return glib::ControlFlow::Break;
+                    }
+                    this.advance();
+                    glib::ControlFlow::Break
+                });
             }
-        });
-
-        self.showing.replace(Some(message));
-        self.overlay.add_toast(toast);
+            None => {
+                self.revealer.set_reveal_child(false);
+                self.showing.replace(None);
+            }
+        }
     }
 }
 

@@ -47,11 +47,13 @@ Selectors are a stability contract - renames are treated as breaking changes.
 | `#trayplay-page-action` | header button on a list page ("Play") |
 | `#trayplay-loading` | spinner on a list page whose query has not answered yet |
 | `#trayplay-status` | signed-out text |
-| `#trayplay-toast` | toast overlay wrapping the navigation stack; the banner itself is libadwaita's `.toast` node inside it |
+| `#trayplay-toast` | overlay wrapping the navigation stack; the banner itself is `.trayplay-banner` inside it |
 | `#trayplay-row-menu` | a row's right-click menu; its entries are `button` nodes inside it |
 
-A failed library query is a toast rather than a page of its own, so there is no
-error label to style - restyle `#trayplay-toast .toast` instead.
+A failed library query is a banner rather than a page of its own, so there is no
+error label to style - restyle `#trayplay-toast .trayplay-banner` instead. It is
+trayplay's own widget, not an `AdwToast`: libadwaita's toast title cannot wrap,
+so long messages used to be cut off mid-sentence.
 
 Debugging: `GTK_DEBUG=interactive cargo run` opens the GTK inspector, which shows
 the live CSS node tree. Use it when a container stays opaque - it names the exact

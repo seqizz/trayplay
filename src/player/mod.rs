@@ -897,6 +897,22 @@ impl Player {
                     }
                     return Ok(());
                 }
+                // Every track fails the same way until the user reauthenticates,
+                // so this stops outright rather than walking the queue like
+                // `Gone` does - that would just spend the whole queue as one
+                // toast per track. The message is a fixed sentence, not the
+                // downcast error's chain: that chain names the stream URL,
+                // which carries the now-dead api_key as a query parameter.
+                Err(err) if err.downcast_ref::<cache::Unauthorized>().is_some() => {
+                    tracing::warn!(id = %item.id, name = %item.name, "credentials rejected by server");
+                    self.sink.stop();
+                    self.set_state(State::Stopped);
+                    self.resume_pending = true;
+                    self.emit(Event::Failed(
+                        "signed out: run `trayplay login` again".into(),
+                    ));
+                    return Ok(());
+                }
                 // Anything else is transient, so playback stops on this track
                 // rather than propagating the error.
                 //

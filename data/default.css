@@ -394,6 +394,13 @@ button.trayplay-glyph:hover {
   border-radius: 4px;
 }
 
-/* Playback errors are libadwaita toasts and keep its styling by default. The
- * overlay is named only so a theme has a root to reach the banner through:
- * `#trayplay-toast .toast { ... }`. */
+/* Playback errors were libadwaita toasts, but AdwToast's title has no wrap
+ * support - long messages got cut off with no way for a theme to fix it, so
+ * this is trayplay's own banner instead. A theme reaches it through
+ * `#trayplay-toast .trayplay-banner { ... }`. */
+#trayplay-toast .trayplay-banner {
+  background-color: alpha(@window_bg_color, 0.9);
+  border: 1px solid alpha(@borders, 0.4);
+  border-radius: 12px;
+  padding: 8px 14px;
+}

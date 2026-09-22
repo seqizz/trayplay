@@ -38,6 +38,23 @@ impl std::fmt::Display for Gone {
 
 impl std::error::Error for Gone {}
 
+/// The server rejected the request's credentials: a 401 on the stream URL.
+///
+/// Its own type, like `Gone`, so the player can show a clear "reauth" message
+/// instead of the raw transport error - which for a stream URL includes the
+/// api_key and device id in the query string, making it long enough that the
+/// toast clips it before the useful part.
+#[derive(Debug, Clone, Copy)]
+pub struct Unauthorized;
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("credentials rejected by server (401)")
+    }
+}
+
+impl std::error::Error for Unauthorized {}
+
 /// Progressive on-disk track cache.
 ///
 /// Decoding reads from a local file rather than straight from HTTP: rodio's
@@ -360,6 +377,13 @@ impl Cache {
                 // remembered the old ids, including our own restored queue.
                 if resp.status() == reqwest::StatusCode::NOT_FOUND {
                     return Err(anyhow::Error::new(Gone)
+                        .context(format!("streaming {key}")));
+                }
+                // Called out for the same reason as 404: a stale or revoked
+                // token cannot succeed by retrying, and the raw error carries
+                // the api_key in the URL it names.
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    return Err(anyhow::Error::new(Unauthorized)
                         .context(format!("streaming {key}")));
                 }
                 resp.error_for_status()
