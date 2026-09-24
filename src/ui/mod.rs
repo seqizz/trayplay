@@ -1,13 +1,14 @@
 pub mod artists;
 pub mod artwork;
 pub mod browse;
+pub mod login;
 pub mod nowplaying;
 pub mod popup;
 pub mod queue;
 pub mod settings;
 pub mod x11;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::rc::Rc;
@@ -319,6 +320,62 @@ impl Browser {
 pub struct Session {
     pub player: PlayerHandle,
     pub browser: Browser,
+}
+
+/// Session state shared between `main` (which creates a session at startup
+/// when credentials are stored), `build`/`Popup` (which need a session to
+/// exist before *or* after the window is up), and the login form (which
+/// hot-starts one without a restart).
+///
+/// The popup's event bridge is stored here too: the install path creates it
+/// and must be able to pass it to the event loop, and the session object
+/// itself has no place to carry it.
+#[derive(Clone, Default)]
+pub struct AppState {
+    session: Rc<RefCell<Option<Session>>>,
+    events: Rc<RefCell<Option<async_channel::Receiver<Event>>>>,
+    /// Whether the tray's state/tooltip mirror is attached to the current
+    /// session's player. A slot rather than a once-flag: the session is
+    /// replaced by the login flow, at which point the updater has to attach
+    /// to the *new* player. `install_session` releases it, `main`'s
+    /// `maybe_start_tray_updater` claims it, and whichever half of the setup
+    /// is missing at the time resets it so the other half retries.
+    tray_attached: Rc<Cell<bool>>,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn session(&self) -> Option<Session> {
+        self.session.borrow().clone()
+    }
+
+    pub fn set_session(&self, session: Session) {
+        *self.session.borrow_mut() = Some(session);
+    }
+
+    pub fn events(&self) -> Option<async_channel::Receiver<Event>> {
+        self.events.borrow().clone()
+    }
+
+    pub fn set_events(&self, events: async_channel::Receiver<Event>) {
+        *self.events.borrow_mut() = Some(events);
+    }
+
+    /// Claims the tray-updater slot for the current session. Returns true
+    /// when a previous call already holds it, false when this call took it.
+    pub fn claim_tray_updater(&self) -> bool {
+        self.tray_attached.replace(true)
+    }
+
+    /// Frees the tray-updater slot. Called when a session is replaced (its
+    /// old updater stopped with its player) or when a claim had to be given
+    /// back because half the setup was missing.
+    pub fn release_tray_updater(&self) {
+        self.tray_attached.set(false);
+    }
 }
 
 /// Forwards player events onto the GTK main thread.

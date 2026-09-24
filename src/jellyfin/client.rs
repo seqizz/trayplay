@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use super::auth::{device_id, Credentials};
-use super::models::{self, AuthResponse, Item, ItemsResponse, Kind};
+use super::models::{self, AuthResponse, Item, ItemsResponse, Kind, ServerInfo};
 
 const CLIENT_NAME: &str = "trayplay";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -26,6 +26,69 @@ const DIRECT_PLAY_CONTAINERS: &str = "flac,mp3,m4a,aac,wav";
 /// a streamed transcode.
 const TRANSCODE_CODEC: &str = "mp3";
 const TRANSCODE_BITRATE: u32 = 320_000;
+
+/// Normalizes a server URL as typed into the login form: trims whitespace,
+/// defaults a missing scheme to `https://` (a bare `host:port` is what a user
+/// actually types), and trims trailing slashes.
+///
+/// `Client::new` only trims the trailing slash, so a fully normalized URL is
+/// safe to hand it afterwards.
+pub fn normalize_base(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    with_scheme.trim_end_matches('/').to_string()
+}
+
+/// Unauthenticated `GET /System/Info/Public`, used to check a server URL
+/// before a login is attempted.
+///
+/// Errors are mapped by stage so a typo'd URL gets a useful message:
+/// unreachable is different from "this host speaks something else".
+pub async fn probe(base: &str) -> Result<ServerInfo> {
+    let base = normalize_base(base);
+    let url = format!("{base}/System/Info/Public");
+    let resp = match build_http()?.get(&url).send().await {
+        Ok(resp) => resp,
+        // Connection refused, DNS, TLS, timeout: nothing to respond at all.
+        Err(err) => bail!("cannot reach {url}: {err}"),
+    };
+    if !resp.status().is_success() {
+        bail!(
+            "that does not look like a Jellyfin server (HTTP {})",
+            resp.status()
+        );
+    }
+    match resp.json().await {
+        Ok(info) => Ok(info),
+        // A 200 from something that is not Jellyfin (an app, a portal page).
+        Err(err) => {
+            tracing::debug!(%err, %url, "probe response did not parse");
+            bail!("that does not look like a Jellyfin server");
+        }
+    }
+}
+
+/// The server refused the request's credentials: HTTP 401 on an authenticated
+/// request.
+///
+/// A type rather than a message string so the player and the UI can recognise
+/// "must sign in again" without matching text; stream fetches (see
+/// `player::cache`) and library queries both map their 401 onto this same
+/// error.
+#[derive(Debug, Clone, Copy)]
+pub struct Unauthorized;
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("credentials rejected by server (401)")
+    }
+}
+
+impl std::error::Error for Unauthorized {}
 
 pub struct Client {
     http: reqwest::Client,
@@ -58,6 +121,11 @@ impl Client {
         self.creds
             .as_ref()
             .context("not authenticated, run `trayplay login` first")
+    }
+
+    /// Returns a clone of the credentials if authenticated.
+    pub fn creds_clone(&self) -> Option<Credentials> {
+        self.creds.clone()
     }
 
     pub fn user_id(&self) -> Result<&str> {
@@ -100,6 +168,9 @@ impl Client {
         // 401 here means bad credentials, which deserves a clearer message than
         // a raw status dump.
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Ok(body) = resp.text().await {
+                tracing::debug!("login 401 body: {}", body);
+            }
             bail!("authentication rejected: wrong username or password");
         }
         let resp = resp.error_for_status().context("login failed")?;
@@ -113,6 +184,40 @@ impl Client {
         };
         self.creds = Some(creds.clone());
         Ok(creds)
+    }
+
+    /// Verifies that the current session token is still valid.
+    /// Returns an error if the server rejects it with 401.
+    pub async fn validate(&self) -> Result<()> {
+        // Test an authenticated endpoint that mirrors the playback auth pattern.
+        // /Users/{id}/Items requires auth and uses the same header/creds as stream fetches.
+        let creds = self.creds()?;
+        tracing::debug!(
+            user_id = %creds.user_id,
+            token_len = creds.token.len(),
+            "validating session token"
+        );
+        let url = format!(
+            "{}/Users/{}/Items?limit=1&fields=ProviderIds",
+            self.base, creds.user_id
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Ok(body) = resp.text().await {
+                tracing::warn!("validate 401 body: {}", body);
+            }
+            return Err(anyhow::Error::new(Unauthorized)
+                .context("token rejected by server"));
+        }
+
+        resp.error_for_status().context("validate check failed")?;
+        Ok(())
     }
 
     /// POST with no useful reply, which is every playback-reporting endpoint.
@@ -145,7 +250,11 @@ impl Client {
             .with_context(|| format!("GET {url}"))?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            bail!("token rejected by server, run `trayplay login` again");
+            // Typed, not a bare message: the player checks for this error to
+            // know the session has to be recreated. The human-readable part
+            // stays for CLI callers of this method.
+            return Err(anyhow::Error::new(Unauthorized)
+                .context("token rejected by server, run `trayplay login` again"));
         }
         let resp = resp
             .error_for_status()
@@ -482,11 +591,16 @@ impl Client {
     /// DSD) simply fails. Here the server direct-plays what is listed in
     /// DIRECT_PLAY_CONTAINERS and transcodes the rest to mp3.
     ///
-    /// The token goes in the query string because the cache fetches this URL
-    /// without our Authorization header.
-    pub fn stream_url(&self, item_id: &str) -> Result<String> {
+    /// The token is returned separately so the cache can add it as an auth
+    /// header instead of relying on the deprecated api_key query param.
+    pub fn stream_url(&self, item_id: &str) -> Result<(String, String)> {
         let creds = self.creds()?;
-        Ok(format!(
+        tracing::debug!(
+            user_id = %creds.user_id,
+            token_len = creds.token.len(),
+            "generating stream URL"
+        );
+        let url = format!(
             "{base}/Audio/{item_id}/universal\
              ?userId={user}\
              &deviceId={device}\
@@ -495,16 +609,15 @@ impl Client {
              &transcodingContainer={codec}\
              &transcodingProtocol=http\
              &maxStreamingBitrate={bitrate}\
-             &enableRedirection=true\
-             &api_key={token}",
+             &enableRedirection=true",
             base = self.base,
             user = urlencoding::encode(&creds.user_id),
             device = urlencoding::encode(&self.device_id),
             containers = DIRECT_PLAY_CONTAINERS,
             codec = TRANSCODE_CODEC,
             bitrate = TRANSCODE_BITRATE,
-            token = urlencoding::encode(&creds.token),
-        ))
+        );
+        Ok((url, creds.token.clone()))
     }
 
     /// Raw GET, used for cover art. Kept here so callers do not need the inner
@@ -516,10 +629,20 @@ impl Client {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()
             .with_context(|| format!("GET {url}"))?;
-        Ok(resp.bytes().await?.to_vec())
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            tracing::debug!("fetch_bytes 401 on url={}", url);
+            return Err(anyhow::Error::new(Unauthorized)
+                .context("token rejected by server"));
+        }
+
+        let status = resp.status();
+        let body = resp.bytes().await.with_context(|| format!("GET {url}"))?;
+        if !status.is_success() {
+            return Err(anyhow::format_err!("fetch failed with HTTP {}", status));
+        }
+        Ok(body.to_vec())
     }
 
     pub fn image_url(&self, item_id: &str, tag: &str, max_height: u32) -> String {

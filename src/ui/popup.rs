@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use adw::prelude::*;
@@ -11,10 +12,13 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use crate::config::{Anchor, Config, Settings};
 use crate::jellyfin::models::{Item, Kind};
 use crate::player::{Command, Event, PlayerHandle};
+use crate::tray::{TrayBackend, UiRequest};
+use crate::{maybe_start_tray_updater, start_session};
 
 use super::browse::{ListPage, RowAction, Section};
+use super::login;
 use super::nowplaying::{Navigate, NowPlaying};
-use super::Session;
+use super::{AppState, Session};
 
 /// How long a playback error stays on screen. Long enough to read a sentence,
 /// short enough that it is gone by the next interaction.
@@ -53,16 +57,41 @@ pub struct Popup {
     /// just using this" from "this has been sitting there unfocused". See
     /// `toggle`.
     unfocused_since: Rc<Cell<Option<Instant>>>,
+    /// True once the popup's content has been swapped to the sign-in form
+    /// after the server rejected the stored token. The player keeps failing
+    /// until the user signs in, so the swap must happen once, not once per
+    /// attempt. Reset when a new session installs, so a session that expires
+    /// again swaps again.
+    on_login: Rc<Cell<bool>>,
+    /// Shared with the settings switch so flipping it applies at once.
+    hide_on_blur: Rc<Cell<bool>>,
+    /// Carried for the login/relogin pages, the cache limit and the session
+    /// hot-start (which needs config to build a player).
+    cfg: Config,
+    /// Where the session comes from and where the hot-start path writes it.
+    state: AppState,
+    /// Requests to the window (toggle/show/hide/quit) for MPRIS and the tray.
+    tray_ui: async_channel::Sender<UiRequest>,
+    /// Whichever tray backend is registered, so a late session can get its
+    /// player into it. Read by the login callback and `install_session`.
+    tray_backend: Rc<RefCell<Option<TrayBackend>>>,
+    /// The player tray clicks/scrolls forward to, on the backends' own
+    /// threads.
+    tray_player: Arc<Mutex<Option<PlayerHandle>>>,
 }
 
 impl Popup {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         app: &adw::Application,
         cfg: &Config,
         display: &gdk::Display,
-        session: Option<Session>,
-        events: Option<async_channel::Receiver<Event>>,
-    ) -> Self {
+        state: &AppState,
+        rt: tokio::runtime::Handle,
+        tray_ui: async_channel::Sender<UiRequest>,
+        tray_backend: &Rc<RefCell<Option<TrayBackend>>>,
+        tray_player: &Arc<Mutex<Option<PlayerHandle>>>,
+    ) -> Rc<Self> {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .default_width(cfg.width)
@@ -86,6 +115,21 @@ impl Popup {
         // Closing must not tear down the app; the tray owns the lifetime.
         window.set_hide_on_close(true);
 
+        let unfocused_since = Rc::new(Cell::new(None));
+        let on_login = Rc::new(Cell::new(false));
+
+        let me = Rc::new(Self {
+            window: window.clone(),
+            unfocused_since: unfocused_since.clone(),
+            on_login: on_login.clone(),
+            hide_on_blur: hide_on_blur.clone(),
+            cfg: cfg.clone(),
+            state: state.clone(),
+            tray_ui: tray_ui.clone(),
+            tray_backend: tray_backend.clone(),
+            tray_player: tray_player.clone(),
+        });
+
         // Independent of `wire_shortcuts` below: Ctrl+Q must quit even
         // signed out (no session, no now-playing view to attach shortcuts
         // to) or from a pushed page, not just the root. Wired before
@@ -93,45 +137,17 @@ impl Popup {
         // sees (and stops) Ctrl+Q first - plain `q` on the root page still
         // reaches `NowPlaying::handle_key` and opens the queue as usual,
         // since that has no modifier check of its own.
-        let quit_player = session.as_ref().map(|s| s.player.clone());
-        wire_quit(&window, app, quit_player);
+        wire_quit(&window, app, &me.state);
 
-        match session {
-            Some(session) => {
-                let nav = adw::NavigationView::new();
-                nav.set_widget_name("trayplay-nav");
-
-                let now_playing = build_now_playing(
-                    &nav,
-                    session,
-                    hide_on_blur.clone(),
-                    cfg.cache_max_mb,
-                );
-                nav.add(&now_playing.0);
-                wire_shortcuts(&window, &nav, &now_playing.1);
-
-                // Toasts live outside the navigation stack so an error raised
-                // from a browse page is still visible after it pops back to
-                // now-playing.
-                let toaster = Toaster::new(&nav);
-                window.set_content(Some(&toaster.overlay));
-
-                // Opening the popup should always land on now-playing, never
-                // halfway down someone else's discography. Hooked to the hide
-                // signal rather than to each caller, so auto-hide, Escape, the
-                // tray toggle and MPRIS all reset alike.
-                let nav_weak = nav.downgrade();
-                window.connect_hide(move |_| {
-                    if let Some(nav) = nav_weak.upgrade() {
-                        nav.pop_to_tag("now-playing");
-                    }
-                });
-
-                if let Some(events) = events {
-                    spawn_event_loop(now_playing.1, toaster, events);
-                }
-            }
-            None => window.set_content(Some(&signed_out_page())),
+        // No session (fresh install, no audio device, or one the server
+        // rejected): the sign-in form is the whole content, and its success
+        // path hot-starts the session here, in place. With a session already
+        // in state, `build` calls `install_session` right after this returns.
+        if me.state.session().is_none() {
+            let popup = me.clone();
+            let form_rt = rt.clone();
+            let on_signed_in: login::OnSignedIn = Rc::new(move || popup.hot_start(&form_rt));
+            window.set_content(Some(&login::page(cfg, &rt, None, Some(on_signed_in))));
         }
 
         // Before the first map, so the window manager sees the type it is
@@ -165,7 +181,6 @@ impl Popup {
             );
         }
 
-        let unfocused_since = Rc::new(Cell::new(None));
         Self::wire_dismiss(
             &window,
             hide_on_blur,
@@ -173,10 +188,100 @@ impl Popup {
             std::time::Duration::from_millis(cfg.hide_delay_ms),
         );
 
-        Self {
-            window,
-            unfocused_since,
+        me
+    }
+
+    /// Replaces the current session with a fresh one built from the stored
+    /// credentials, then installs its view. The login form's success path and
+    /// the session-expiry page both end here; an `Err` keeps the form up with
+    /// the reason inline (no audio device, ...) rather than installing a
+    /// half-built session.
+    fn hot_start(self: &Rc<Self>, rt: &tokio::runtime::Handle) -> Result<(), String> {
+        let old = self.state.session();
+        // The session being replaced is told to stop outright: closing its
+        // player's broadcast is what ends every older subscriber (tray
+        // updater, UI bridge, event loop), so history cannot keep writing to
+        // the tray or the window from the dead session.
+        if let Some(session) = &old {
+            session.player.send(Command::Shutdown);
         }
+        let session = start_session(&self.cfg, rt, self.tray_ui.clone())
+            .map_err(|err| format!("{err}"))?
+            .ok_or_else(|| "stored credentials did not load".to_string())?;
+        self.state.set_session(session.clone());
+        self.install_session(rt);
+        Ok(())
+    }
+
+    /// Installs the signed-in view (navigation, now-playing, toaster) for the
+    /// session in `state`, replacing whatever content the window had. Called
+    /// from `build` when a session was loaded at startup and from
+    /// `hot_start` after a login, so both paths build the same UI.
+    ///
+    /// Order matters, and it is the order that used to live in `main`: every
+    /// event subscriber attaches before `Command::Restore`, because the
+    /// broadcast channel drops events sent before a receiver exists. MPRIS
+    /// and the playback reporter subscribed when the session was created; the
+    /// UI bridge and the tray updater subscribe here, still before the
+    /// restore.
+    pub(crate) fn install_session(self: &Rc<Self>, rt: &tokio::runtime::Handle) {
+        let Some(session) = self.state.session() else { return };
+
+        // A fresh session means a future session-expiry gets its own swap to
+        // the sign-in form; the previous session's swap flag no longer applies.
+        self.on_login.set(false);
+
+        // The bridge is created once per session and kept in shared state for
+        // the event loop to pick up.
+        let events = match self.state.events() {
+            Some(events) => events,
+            None => {
+                let events = super::bridge_events(rt, &session.player);
+                self.state.set_events(events.clone());
+                events
+            }
+        };
+
+        // A session that replaces an earlier one gets its own tray mirror; the
+        // earlier updater stopped with its player.
+        self.state.release_tray_updater();
+        maybe_start_tray_updater(rt, &self.state, &self.tray_backend, &self.tray_player);
+
+        let nav = adw::NavigationView::new();
+        nav.set_widget_name("trayplay-nav");
+
+        let player = session.player.clone();
+        let now_playing = build_now_playing(
+            &nav,
+            session,
+            self.hide_on_blur.clone(),
+            self.cfg.cache_max_mb,
+        );
+        nav.add(&now_playing.0);
+        wire_shortcuts(&self.window, &nav, &now_playing.1);
+
+        // Toasts live outside the navigation stack so an error raised from a
+        // browse page is still visible after it pops back to now-playing.
+        let toaster = Toaster::new(&nav);
+        self.window.set_content(Some(&toaster.overlay));
+
+        // Opening the popup should always land on now-playing, never halfway
+        // down someone else's discography. Hooked to the hide signal rather
+        // than to each caller, so auto-hide, Escape, the tray toggle and MPRIS
+        // all reset alike.
+        let nav_weak = nav.downgrade();
+        self.window.connect_hide(move |_| {
+            if let Some(nav) = nav_weak.upgrade() {
+                nav.pop_to_tag("now-playing");
+            }
+        });
+
+        spawn_event_loop(now_playing.1, toaster, events, self.clone(), rt);
+
+        // Last, after every subscriber: Restore emits TrackChanged, and the
+        // restored track is what the view (and MPRIS) wake up to. Nothing
+        // starts playing - the track is shown, and Play picks it up.
+        player.send(Command::Restore);
     }
 
     fn wire_dismiss(
@@ -317,17 +422,21 @@ fn schedule_hide(
 /// the window itself rather than through `wire_shortcuts`, so it fires from
 /// any page and even when there is no session to attach a now-playing view
 /// to.
-fn wire_quit(window: &adw::ApplicationWindow, app: &adw::Application, player: Option<PlayerHandle>) {
+fn wire_quit(window: &adw::ApplicationWindow, app: &adw::Application, state: &AppState) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
 
     let app = app.clone();
+    let state = state.clone();
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         // `.contains`, not `==`: a Caps Lock state bit riding along in
         // `modifiers` would otherwise silently break this while it's on.
         if key == gdk::Key::q && modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
-            if let Some(player) = &player {
-                player.send(Command::Shutdown);
+            // Looked up on demand, not captured: the session may not exist at
+            // startup (login form showing) and may have been replaced since
+            // (hot-start), and quitting must stop whichever player is live.
+            if let Some(session) = state.session() {
+                session.player.send(Command::Shutdown);
             }
             app.quit();
             return glib::Propagation::Stop;
@@ -348,10 +457,21 @@ fn wire_shortcuts(
 
     let nav = nav.downgrade();
     let now_playing = Rc::downgrade(now_playing);
-    keys.connect_key_pressed(move |_, key, _, modifiers| {
+    keys.connect_key_pressed(move |controller, key, _, modifiers| {
         let (Some(nav), Some(now_playing)) = (nav.upgrade(), now_playing.upgrade()) else {
             return glib::Propagation::Proceed;
         };
+
+        // Only handle keys when nav is actually the window content.
+        // If login page (or other) replaces it, let keypress reach the Entry widgets.
+        if let Some(window) = controller.widget().and_downcast::<adw::ApplicationWindow>() {
+            if let Some(content) = window.child() {
+                if !content.is::<gtk::Overlay>() {
+                    return glib::Propagation::Proceed;
+                }
+            }
+        }
+
         let on_root = nav
             .visible_page()
             .and_then(|page| page.tag())
@@ -1212,24 +1332,6 @@ fn toast_error(context: &str, err: &anyhow::Error) {
     }
 }
 
-/// Shown when there are no credentials or no audio device.
-fn signed_out_page() -> gtk::Widget {
-    let label = gtk::Label::builder()
-        .label("Not signed in.\n\nRun `trayplay login` in a terminal, then restart trayplay.")
-        .justify(gtk::Justification::Center)
-        .wrap(true)
-        .build();
-    label.set_widget_name("trayplay-status");
-
-    let body = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .valign(gtk::Align::Center)
-        .build();
-    body.add_css_class("trayplay-body");
-    body.append(&label);
-    body.upcast()
-}
-
 thread_local! {
     /// The live popup's toaster.
     ///
@@ -1378,7 +1480,11 @@ fn spawn_event_loop(
     now_playing: Rc<NowPlaying>,
     toaster: Rc<Toaster>,
     events: async_channel::Receiver<Event>,
+    popup: Rc<Popup>,
+    rt: &tokio::runtime::Handle,
 ) {
+    let popup = popup.clone();
+    let rt = rt.clone();
     glib::spawn_future_local(async move {
         while let Ok(event) = events.recv().await {
             match event {
@@ -1414,6 +1520,32 @@ fn spawn_event_loop(
                     // as the only record.
                     tracing::warn!(message, "playback error");
                     toaster.show(message);
+                }
+                // The stored token was rejected, so the session is dead until
+                // the user signs in again. The sign-in form replaces the whole
+                // content (kept prefilled from the stored login), which also
+                // replaces the Toaster - so the "relogin" message lives on the
+                // form rather than in a toast that would be swapped away with
+                // the overlay it is drawn on. Its success path hot-starts,
+                // exactly like the startup form's.
+                Event::SessionExpired => {
+                    // The load this reports (if it was one) is over, and a
+                    // pending seek can never confirm either.
+                    now_playing.clear_loading();
+                    now_playing.cancel_pending_seek();
+                    tracing::warn!("credentials rejected by server, showing sign-in form");
+                    if !popup.on_login.replace(true) {
+                        let form_popup = popup.clone();
+                        let form_rt = rt.clone();
+                        let on_signed_in: login::OnSignedIn =
+                            Rc::new(move || form_popup.hot_start(&form_rt));
+                        popup.window.set_content(Some(&login::page(
+                            &popup.cfg,
+                            &rt,
+                            Some("Signed out by the server. Sign in again."),
+                            Some(on_signed_in),
+                        )));
+                    }
                 }
             }
         }

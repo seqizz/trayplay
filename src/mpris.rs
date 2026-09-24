@@ -241,6 +241,11 @@ async fn run(
             // until the new one actually starts, which is when `TrackChanged`
             // republishes the metadata.
             Ok(Event::Loading(_)) | Ok(Event::Buffering { .. }) => {}
+            // The server rejected the stored token: playback is over and the
+            // popup shows the sign-in form. MPRIS has nothing of its own to
+            // publish - the state change to Stopped, if any, already arrived
+            // as `StateChanged` - so this is a no-op.
+            Ok(Event::SessionExpired) => {}
             Err(RecvError::Lagged(n)) => tracing::debug!(skipped = n, "MPRIS fell behind"),
             Err(RecvError::Closed) => break,
         }

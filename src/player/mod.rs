@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::config::{Repeat, Settings};
 use crate::jellyfin::models::Item;
-use crate::jellyfin::Client;
+use crate::jellyfin::{Client, Unauthorized};
 use cache::Cache;
 use queue::{Mode, Queue};
 use sink::AudioSink;
@@ -202,6 +202,13 @@ pub enum Event {
     Notice(String),
     /// Recoverable failure worth surfacing in the UI.
     Failed(String),
+    /// The server rejected the stored credentials, so nothing can be fetched
+    /// or streamed until the user signs in again.
+    ///
+    /// Distinct from `Failed`: a dead session is not a transient error to
+    /// retry per track, and the UI reacts to it by showing the sign-in form
+    /// rather than toasting the same sentence once per attempt.
+    SessionExpired,
 }
 
 #[derive(Clone)]
@@ -316,13 +323,13 @@ impl Player {
                     }
                     if let Err(err) = self.handle(cmd).await {
                         tracing::warn!(%err, "command failed");
-                        self.emit(Event::Failed(format!("{err:#}")));
+                        self.fail(&err);
                     }
                 }
                 _ = ticker.tick() => {
                     if let Err(err) = self.tick().await {
                         tracing::warn!(%err, "tick failed");
-                        self.emit(Event::Failed(format!("{err:#}")));
+                        self.fail(&err);
                     }
                 }
             }
@@ -333,6 +340,17 @@ impl Player {
     fn emit(&self, event: Event) {
         // No subscribers is normal at startup, so a send error is not a problem.
         let _ = self.events.send(event);
+    }
+
+    /// Surfaces a command or tick failure - except when the error chain means
+    /// the stored credentials were rejected: that is not a transient error to
+    /// retry, it is the cue for the UI to swap to the sign-in form.
+    fn fail(&self, err: &anyhow::Error) {
+        if err.downcast_ref::<Unauthorized>().is_some() {
+            self.emit(Event::SessionExpired);
+        } else {
+            self.emit(Event::Failed(format!("{err:#}")));
+        }
     }
 
     fn set_state(&mut self, state: State) {
@@ -900,17 +918,16 @@ impl Player {
                 // Every track fails the same way until the user reauthenticates,
                 // so this stops outright rather than walking the queue like
                 // `Gone` does - that would just spend the whole queue as one
-                // toast per track. The message is a fixed sentence, not the
-                // downcast error's chain: that chain names the stream URL,
-                // which carries the now-dead api_key as a query parameter.
-                Err(err) if err.downcast_ref::<cache::Unauthorized>().is_some() => {
+                // toast per track. The `SessionExpired` event is what makes the
+                // UI show the sign-in form; nothing is emitted here that could
+                // leak the stream URL, which carries the now-dead api_key as a
+                // query parameter.
+                Err(err) if err.downcast_ref::<Unauthorized>().is_some() => {
                     tracing::warn!(id = %item.id, name = %item.name, "credentials rejected by server");
                     self.sink.stop();
                     self.set_state(State::Stopped);
                     self.resume_pending = true;
-                    self.emit(Event::Failed(
-                        "signed out: run `trayplay login` again".into(),
-                    ));
+                    self.emit(Event::SessionExpired);
                     return Ok(());
                 }
                 // Anything else is transient, so playback stops on this track
@@ -1010,7 +1027,7 @@ impl Player {
     /// across an await would require Player to be Sync, which the boxed
     /// AudioSink is not.
     async fn open(&mut self, item: &Item) -> Result<cache::CacheReader> {
-        let url = self.client.stream_url(&item.id)?;
+        let (url, _token) = self.client.stream_url(&item.id)?;
         self.cache
             .open_for_playback(&item.id, extension(item), &url)
             .await
@@ -1019,7 +1036,7 @@ impl Player {
 
     /// Reader over a complete file, needed wherever the decoder must seek.
     async fn open_complete(&mut self, item: &Item) -> Result<cache::CacheReader> {
-        let url = self.client.stream_url(&item.id)?;
+        let (url, _token) = self.client.stream_url(&item.id)?;
         self.cache
             .fetch(&item.id, extension(item), &url)
             .await
@@ -1095,7 +1112,7 @@ impl Player {
         if self.warming.as_deref() == Some(item.id.as_str()) {
             return;
         }
-        let Ok(url) = self.client.stream_url(&item.id) else {
+        let Ok((url, _token)) = self.client.stream_url(&item.id) else {
             return;
         };
         self.warming = Some(item.id.clone());

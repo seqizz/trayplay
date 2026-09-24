@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 
+use crate::jellyfin::Unauthorized;
 use super::Event;
 
 /// Smallest gap between two `Event::Buffering` reports for one download.
@@ -38,24 +39,11 @@ impl std::fmt::Display for Gone {
 
 impl std::error::Error for Gone {}
 
-/// The server rejected the request's credentials: a 401 on the stream URL.
-///
-/// Its own type, like `Gone`, so the player can show a clear "reauth" message
-/// instead of the raw transport error - which for a stream URL includes the
-/// api_key and device id in the query string, making it long enough that the
-/// toast clips it before the useful part.
-#[derive(Debug, Clone, Copy)]
-pub struct Unauthorized;
-
-impl std::fmt::Display for Unauthorized {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("credentials rejected by server (401)")
-    }
-}
-
-impl std::error::Error for Unauthorized {}
-
 /// Progressive on-disk track cache.
+///
+/// Stream fetches map a URL's 401 onto `jellyfin::client::Unauthorized`, the
+/// same type queue refills and library queries use, so the player needs exactly
+/// one check to recognise "must sign in again" anywhere in the app.
 ///
 /// Decoding reads from a local file rather than straight from HTTP: rodio's
 /// decoder needs `Read + Seek`, and satisfying `Seek` with ranged requests is
@@ -68,6 +56,7 @@ impl std::error::Error for Unauthorized {}
 pub struct Cache {
     dir: PathBuf,
     http: reqwest::Client,
+    token: String,
     /// Atomic because the settings page can change it while tracks are
     /// downloading, and every download finishes by pruning against it.
     max_bytes: AtomicU64,
@@ -153,11 +142,17 @@ impl Progress {
 }
 
 impl Cache {
-    pub fn new(dir: PathBuf, max_bytes: u64, http: reqwest::Client) -> Result<Self> {
+    pub fn new(
+        dir: PathBuf,
+        max_bytes: u64,
+        http: reqwest::Client,
+        token: String,
+    ) -> Result<Self> {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(Self {
             dir,
             http,
+            token,
             max_bytes: AtomicU64::new(max_bytes),
             inflight: Mutex::new(HashMap::new()),
             events: OnceLock::new(),
@@ -364,6 +359,7 @@ impl Cache {
         let resp = match self
             .http
             .get(url)
+            .header("Authorization", format!("MediaBrowser Token={}", self.token))
             .send()
             .await
             .with_context(|| format!("GET {key}"))

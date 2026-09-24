@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{OfflineReason, Orientation};
 
@@ -7,14 +9,17 @@ use super::{icon_name_for_state, UiRequest};
 
 pub struct Tray {
     ui: async_channel::Sender<UiRequest>,
-    /// None until credentials exist or if audio output could not be opened.
-    player: Option<PlayerHandle>,
+    /// A session's player when one exists (stored credentials at startup, or
+    /// a finished login). Shared with the XEmbed backend: the tray runs on its
+    /// own task thread, so the cell is a mutex, and both backends see the same
+    /// player once `main`'s `maybe_start_tray_updater` fills it in.
+    player: Arc<Mutex<Option<PlayerHandle>>>,
     pub state: State,
     pub now_playing: Option<String>,
 }
 
 impl Tray {
-    pub fn new(ui: async_channel::Sender<UiRequest>, player: Option<PlayerHandle>) -> Self {
+    pub fn new(ui: async_channel::Sender<UiRequest>, player: Arc<Mutex<Option<PlayerHandle>>>) -> Self {
         Self {
             ui,
             player,
@@ -30,7 +35,7 @@ impl Tray {
     }
 
     fn command(&self, cmd: Command) {
-        match &self.player {
+        match self.player.lock().unwrap().as_ref() {
             Some(player) => player.send(cmd),
             None => tracing::warn!("no player available, run `trayplay login`"),
         }

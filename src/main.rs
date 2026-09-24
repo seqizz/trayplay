@@ -89,46 +89,15 @@ fn main() -> Result<()> {
     // directly. Window requests are funnelled through this channel instead.
     let (tx, rx) = async_channel::unbounded::<UiRequest>();
 
-    // Missing credentials or a broken audio device are not fatal: the tray still
-    // comes up, and the popup will offer a login form once the UI milestone lands.
-    let session = match start_player(&cfg, &rt) {
-        Ok(Some((handle, client))) => {
-            mpris::spawn(handle.clone(), tx.clone(), client.clone());
-            // Before `Command::Restore` is sent below, like every other
-            // subscriber - though this one has nothing to do with the restore
-            // event, since a restored session is not playing.
-            if cfg.report_playback {
-                report::spawn(rt.handle(), &handle, client.clone());
-            }
-            Some(ui::Session {
-                player: handle,
-                browser: ui::Browser::new(
-                    rt.handle().clone(),
-                    client,
-                    std::time::Duration::from_secs(cfg.library_cache_ttl_secs),
-                ),
-            })
-        }
-        Ok(None) => None,
-        Err(err) => {
-            tracing::error!(%err, "player unavailable");
-            None
-        }
-    };
-    let player = session.as_ref().map(|s| s.player.clone());
-
-    // Player events reach GTK over a channel; the broadcast receiver itself
-    // cannot be awaited from glib's executor.
-    let ui_events = player
-        .as_ref()
-        .map(|p| ui::bridge_events(rt.handle(), p));
-
-    // Only now: Restore emits TrackChanged, and the broadcast channel drops
-    // events sent before a receiver exists, so MPRIS, the tray updater and the
-    // UI bridge all have to be subscribed first. Nothing starts playing - the
-    // restored track is shown, and Play picks it up.
-    if let Some(player) = &player {
-        player.send(player::Command::Restore);
+    // Missing credentials or a broken audio device are not fatal: the tray
+    // still comes up, and the popup shows the login form in that case. The
+    // session (when one exists) lives in shared state: `build` installs its
+    // view at `activate`, and the login form hot-starts a fresh one later.
+    let state = ui::AppState::new();
+    match start_session(&cfg, rt.handle(), tx.clone()) {
+        Ok(Some(session)) => state.set_session(session),
+        Ok(None) => tracing::info!("no stored credentials, sign-in form will show in the popup"),
+        Err(err) => tracing::error!(%err, "player unavailable"),
     }
 
     // Which tray backend to use is a display-backend question (XEmbed needs a
@@ -140,13 +109,13 @@ fn main() -> Result<()> {
 
     let rt_handle = rt.handle().clone();
     let tray_backend_for_build = tray_backend.clone();
+    let state_for_build = state.clone();
     app.connect_activate(move |app| {
         if let Err(err) = build(
             app,
             &cfg,
             &rx,
-            &session,
-            &ui_events,
+            &state_for_build,
             tx.clone(),
             rt_handle.clone(),
             &tray_backend_for_build,
@@ -178,7 +147,7 @@ fn main() -> Result<()> {
 #[allow(clippy::type_complexity)]
 fn start_player(
     cfg: &Config,
-    rt: &tokio::runtime::Runtime,
+    rt: &tokio::runtime::Handle,
 ) -> Result<Option<(player::PlayerHandle, Arc<jellyfin::Client>)>> {
     let Some(creds) = jellyfin::FileStore::new()?.load()? else {
         tracing::warn!("no stored credentials, run `trayplay login`");
@@ -188,6 +157,13 @@ fn start_player(
 
     let client = Arc::new(jellyfin::Client::authenticated(creds)?);
 
+    // Verify the loaded credentials actually work before starting the player.
+    // If the server rejects the token (expired, revoked, or rate-limited),
+    // bail out so the UI can show the login form instead of failing at playback.
+    rt.block_on(client.validate())
+        .context("session token invalid, please sign in again")?;
+
+    let token = client.creds_clone().map(|c| c.token).unwrap_or_default();
     let cache = Arc::new(player::cache::Cache::new(
         config::cache_dir()?,
         // The settings page's value wins; config.toml is the fallback for
@@ -198,6 +174,7 @@ fn start_player(
             * 1024
             * 1024,
         client.http(),
+        token,
     )?);
     if let Err(err) = cache.prune() {
         tracing::warn!(%err, "initial cache prune failed");
@@ -218,6 +195,41 @@ fn start_player(
         repeat,
     );
     Ok(Some((handle, client)))
+}
+
+/// Builds a full session on top of stored credentials: player, MPRIS, and the
+/// playback reporter (when enabled).
+///
+/// Both the launch path and the login form's hot-start path funnel through
+/// here, so a session signed in after startup looks exactly like one loaded
+/// from disk. No `Command::Restore` is sent - `Popup::install_session` sends
+/// it once every event subscriber, the tray's included, is attached.
+fn start_session(
+    cfg: &Config,
+    rt: &tokio::runtime::Handle,
+    tray_ui: async_channel::Sender<UiRequest>,
+) -> Result<Option<ui::Session>> {
+    let Some((handle, client)) = start_player(cfg, rt)? else {
+        tracing::warn!("no stored credentials, run `trayplay login` or use the popup");
+        return Ok(None);
+    };
+
+    mpris::spawn(handle.clone(), tray_ui, client.clone());
+    // Before `Command::Restore`, like every other subscriber - though this one
+    // has nothing to do with the restore event, since a restored session is
+    // not playing.
+    if cfg.report_playback {
+        report::spawn(rt, &handle, client.clone());
+    }
+
+    Ok(Some(ui::Session {
+        player: handle,
+        browser: ui::Browser::new(
+            rt.clone(),
+            client,
+            std::time::Duration::from_secs(cfg.library_cache_ttl_secs),
+        ),
+    }))
 }
 
 /// Mirrors player state onto the tray icon and tooltip. Only used for the SNI
@@ -264,13 +276,47 @@ fn spawn_tray_updater(
     });
 }
 
+/// Attaches the tray's player mirror once both halves exist: a session and a
+/// registered tray backend. One half or the other is usually async (the
+/// session may hot-start after startup, the SNI backend registers on the
+/// runtime), so the caller that has its half retries on the slot.
+///
+/// The session is handed to the backends through the shared `tray_player`
+/// cell as well, so click/scroll handlers forward commands to the live
+/// session's player even when it was created after the backend.
+fn maybe_start_tray_updater(
+    rt: &tokio::runtime::Handle,
+    state: &ui::AppState,
+    tray_backend: &Rc<RefCell<Option<TrayBackend>>>,
+    tray_player: &std::sync::Mutex<Option<player::PlayerHandle>>,
+) {
+    if state.claim_tray_updater() {
+        return;
+    }
+    let Some(session) = state.session() else {
+        state.release_tray_updater();
+        return;
+    };
+    *tray_player.lock().unwrap() = Some(session.player.clone());
+    match tray_backend.borrow().as_ref() {
+        Some(TrayBackend::Sni(handle)) => {
+            spawn_tray_updater(rt, handle.clone(), &session.player);
+        }
+        Some(TrayBackend::XEmbed(handle)) => handle.start_updater(rt, session.player.clone()),
+        None => {
+            // The SNI backend registers asynchronously; its callback calls
+            // this again once the handle exists.
+            state.release_tray_updater();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build(
     app: &adw::Application,
     cfg: &Config,
     rx: &async_channel::Receiver<UiRequest>,
-    session: &Option<ui::Session>,
-    ui_events: &Option<async_channel::Receiver<player::Event>>,
+    state: &ui::AppState,
     tray_ui: async_channel::Sender<UiRequest>,
     rt: tokio::runtime::Handle,
     tray_backend: &Rc<RefCell<Option<TrayBackend>>>,
@@ -303,7 +349,12 @@ fn build(
     icons::install(&display)?;
     theme::install(&display)?;
 
-    let player = session.as_ref().map(|s| s.player.clone());
+    // The player the tray backends forward commands to. Filled at startup
+    // when a session was loaded; the login hot-start path fills it later. A
+    // mutex because both backends read it from their own threads.
+    let tray_player = std::sync::Arc::new(std::sync::Mutex::new(
+        state.session().map(|s| s.player),
+    ));
 
     // XEmbed needs a real X11 surface to dock, which is the same reason the
     // popup itself waits for `display` before deciding layer-shell vs
@@ -314,22 +365,33 @@ fn build(
         // assume_sni_available means a missing watcher is reported to
         // sni::Tray::watcher_offline rather than failing startup outright.
         let updater_rt = rt.clone();
-        let updater_player = player.clone();
-        let tray_backend = tray_backend.clone();
+        let updater_state = state.clone();
+        let updater_backend = tray_backend.clone();
+        let updater_player = tray_player.clone();
+        let sni_ui = tray_ui.clone();
+        // A separate clone for the coroutine: the async block captures by
+        // move, and the result callback below needs the Arc as well.
+        let tray_for_spawn = updater_player.clone();
         ui::on_runtime(
             &rt,
             async move {
-                sni::Tray::new(tray_ui, player)
+                sni::Tray::new(sni_ui, tray_for_spawn)
                     .assume_sni_available(true)
                     .spawn()
                     .await
             },
             move |result| match result {
                 Ok(handle) => {
-                    if let Some(player) = &updater_player {
-                        spawn_tray_updater(&updater_rt, handle.clone(), player);
-                    }
-                    *tray_backend.borrow_mut() = Some(TrayBackend::Sni(handle));
+                    *updater_backend.borrow_mut() = Some(TrayBackend::Sni(handle));
+                    // With a session already loaded (startup credentials) this
+                    // attaches the tray updater now; otherwise the login
+                    // form's hot-start path does it once a player exists.
+                    maybe_start_tray_updater(
+                        &updater_rt,
+                        &updater_state,
+                        &updater_backend,
+                        &updater_player,
+                    );
                 }
                 Err(err) => tracing::error!(?err, "registering StatusNotifierItem failed"),
             },
@@ -343,8 +405,11 @@ fn build(
         // display" in CLAUDE.md). Scroll works (next/previous), unlike
         // upstream `tray` - see vendor/tray/PATCH.md.
         tracing::info!("no SNI host on X11, docking a plain XEmbed tray icon instead (no menu, no transparency)");
-        match xembed::spawn(&display, &rt, tray_ui, player) {
-            Ok(handle) => *tray_backend.borrow_mut() = Some(TrayBackend::XEmbed(handle)),
+        match xembed::spawn(&display, tray_ui.clone(), tray_player.clone()) {
+            Ok(handle) => {
+                *tray_backend.borrow_mut() = Some(TrayBackend::XEmbed(handle));
+                maybe_start_tray_updater(&rt, state, tray_backend, &tray_player);
+            }
             Err(err) => tracing::error!(?err, "setting up XEmbed tray icon failed"),
         }
     }
@@ -353,13 +418,21 @@ fn build(
     // then restyled.
     ui::settings::apply(&config::Settings::load());
 
-    let popup = Rc::new(Popup::new(
+    let popup = Popup::new(
         app,
         cfg,
         &display,
-        session.clone(),
-        ui_events.clone(),
-    ));
+        state,
+        rt.clone(),
+        tray_ui,
+        tray_backend,
+        &tray_player,
+    );
+
+    // Start the session's view when one was loaded at startup. No-op when
+    // there is none - the login form hot-starts instead. Same code path as the
+    // login flow, so installing later cannot differ from installing now.
+    popup.install_session(&rt);
 
     let app = app.clone();
     let rx = rx.clone();

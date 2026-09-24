@@ -33,6 +33,19 @@ pub struct UserDto {
     pub name: String,
 }
 
+/// Reply of the unauthenticated `/System/Info/Public` probe the login form
+/// runs before asking for a password: the server's name and version, for a
+/// "this is a real Jellyfin and it is reachable" check plus display.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ServerInfo {
+    pub server_name: String,
+    /// Optional only so a stranger answering 200 with something else cannot
+    /// fail the probe over one missing field; the name is the part used.
+    #[serde(default)]
+    pub version: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ItemsResponse {

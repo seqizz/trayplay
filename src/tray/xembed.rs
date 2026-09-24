@@ -41,6 +41,8 @@
 //! would mean linking a second full copy of GTK3 into this GTK4 process just
 //! for six menu items - not worth it. Quit is reachable elsewhere (bound to
 //! Ctrl+Q on the popup window).
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Context, Result};
 use gtk::gdk;
 use gtk::prelude::*;
@@ -77,19 +79,30 @@ const ICON_RENDER_SIZE: i32 = 48;
 /// (`tray::TrayIconImpl`'s own `Drop` tears down its event thread and the
 /// window together).
 pub struct Handle {
-    _icon: TrayIcon,
+    icon: TrayIcon,
+    icons: IconSet,
 }
 
-/// Builds the icon and wires clicks. `rt` is only used to run the
-/// state/tooltip updater on the tokio runtime, same as the SNI backend's
-/// `spawn_tray_updater` in `main.rs` - this backend never touches the GTK
-/// thread at all, since neither the icon window nor its event loop are GTK
-/// objects.
+impl Handle {
+    /// Starts the state/tooltip mirror for a player that appeared after this
+    /// backend (the login hot-start path). At backend spawn time the same
+    /// task is started directly from `spawn`, which owns the icon; here the
+    /// handles were kept for exactly this.
+    pub fn start_updater(&self, rt: &tokio::runtime::Handle, player: PlayerHandle) {
+        spawn_updater(rt, self.icon.clone(), self.icons.clone(), player);
+    }
+}
+
+/// Builds the icon and wires clicks. The state/tooltip mirror is started by
+/// `main`'s `maybe_start_tray_updater` (once a session exists and this
+/// backend is registered), via `Handle::start_updater`, so a session that
+/// appears later - the login hot-start path - gets it too. This backend never
+/// touches the GTK thread at all: neither the icon window nor its event loop
+/// are GTK objects.
 pub fn spawn(
     display: &gdk::Display,
-    rt: &tokio::runtime::Handle,
     ui: async_channel::Sender<UiRequest>,
-    player: Option<PlayerHandle>,
+    tray_player: Arc<Mutex<Option<PlayerHandle>>>,
 ) -> Result<Handle> {
     // Rendered up front, not inside the updater task: `gdk::Display` is a GTK
     // object (`!Send`), so it cannot be carried into a future that a
@@ -106,15 +119,11 @@ pub fn spawn(
         .with_tooltip("trayplay")
         .build()?;
 
-    wire_input(icon.id().clone(), ui, player.clone());
-
-    if let Some(player) = player {
-        spawn_updater(rt, icon.clone(), icons, player);
-    }
-
-    Ok(Handle { _icon: icon })
+    wire_input(icon.id().clone(), ui, tray_player);
+    Ok(Handle { icon, icons })
 }
 
+#[derive(Clone)]
 struct IconSet {
     playing: Icon,
     paused: Icon,
@@ -135,7 +144,11 @@ impl IconSet {
 /// next/previous - the same actions `sni::Tray` gives under SNI. Right click
 /// toggles too: there is no menu to put on it here (see module docs), so it
 /// behaves as a second left click rather than doing nothing.
-fn wire_input(id: TrayIconId, ui: async_channel::Sender<UiRequest>, player: Option<PlayerHandle>) {
+fn wire_input(
+    id: TrayIconId,
+    ui: async_channel::Sender<UiRequest>,
+    tray_player: Arc<Mutex<Option<PlayerHandle>>>,
+) {
     std::thread::spawn(move || {
         let receiver = TrayIconEvent::receiver();
         while let Ok(event) = receiver.recv() {
@@ -159,7 +172,7 @@ fn wire_input(id: TrayIconId, ui: async_channel::Sender<UiRequest>, player: Opti
                             tracing::warn!(%err, "UI channel closed, dropping tray request");
                         }
                     }
-                    MouseButton::Middle => match &player {
+                    MouseButton::Middle => match tray_player.lock().unwrap().as_ref() {
                         Some(player) => player.send(Command::PlayPause),
                         None => tracing::warn!("no player available, run `trayplay login`"),
                     },
@@ -176,7 +189,7 @@ fn wire_input(id: TrayIconId, ui: async_channel::Sender<UiRequest>, player: Opti
                 // Vendored patch (vendor/tray/PATCH.md): upstream has no
                 // Scroll event on X11 at all, this is trayplay's own
                 // addition. Same sign convention as `sni::Tray::scroll`.
-                TrayIconEvent::Scroll { delta, .. } => match &player {
+                TrayIconEvent::Scroll { delta, .. } => match tray_player.lock().unwrap().as_ref() {
                     Some(player) => {
                         if delta < 0 {
                             player.send(Command::Previous);
@@ -198,11 +211,11 @@ fn wire_input(id: TrayIconId, ui: async_channel::Sender<UiRequest>, player: Opti
 fn spawn_updater(rt: &tokio::runtime::Handle, icon: TrayIcon, icons: IconSet, player: PlayerHandle) {
     let mut events = player.subscribe();
     rt.spawn(async move {
-        // A restored queue's TrackChanged is emitted before this backend exists
-        // (the tray is built from `activate`, the restore is sent before it), so
-        // the tooltip is seeded by asking instead of waiting for an event. The
-        // player answers commands in order, so this cannot see the queue as it
-        // was before the restore.
+        // The restored queue's TrackChanged can predate this subscription (the
+        // SNI backend registers asynchronously, after the restore is sent), so
+        // the tooltip is seeded by asking the player rather than waiting for an
+        // event. The player answers commands in order, so this cannot see the
+        // queue as it was before the restore.
         if let Some(snapshot) = player.snapshot().await {
             if let Some(item) = snapshot.items.get(snapshot.cursor) {
                 let label = format!("{} - {}", item.display_artist(), item.name);
