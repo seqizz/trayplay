@@ -1,4 +1,5 @@
 pub mod cache;
+pub use cache::Cache;
 pub mod decoder;
 pub mod persist;
 pub mod queue;
@@ -14,7 +15,6 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::config::{Repeat, Settings};
 use crate::jellyfin::models::Item;
 use crate::jellyfin::{Client, Unauthorized};
-use cache::Cache;
 use queue::{Mode, Queue};
 use sink::AudioSink;
 

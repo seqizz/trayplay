@@ -11,6 +11,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::config::{Anchor, Config, Settings};
 use crate::jellyfin::models::{Item, Kind};
+use crate::ui::Session;
 use crate::player::{Command, Event, PlayerHandle};
 use crate::tray::{TrayBackend, UiRequest};
 use crate::{maybe_start_tray_updater, start_session};
@@ -18,7 +19,7 @@ use crate::{maybe_start_tray_updater, start_session};
 use super::browse::{ListPage, RowAction, Section};
 use super::login;
 use super::nowplaying::{Navigate, NowPlaying};
-use super::{AppState, Session};
+use super::AppState;
 
 /// How long a playback error stays on screen. Long enough to read a sentence,
 /// short enough that it is gone by the next interaction.
@@ -258,7 +259,7 @@ impl Popup {
             self.cfg.cache_max_mb,
         );
         nav.add(&now_playing.0);
-        wire_shortcuts(&self.window, &nav, &now_playing.1);
+        wire_shortcuts(self, &nav, &now_playing.1);
 
         // Toasts live outside the navigation stack so an error raised from a
         // browse page is still visible after it pops back to now-playing.
@@ -448,28 +449,25 @@ fn wire_quit(window: &adw::ApplicationWindow, app: &adw::Application, state: &Ap
 }
 
 fn wire_shortcuts(
-    window: &adw::ApplicationWindow,
+    popup: &Rc<Popup>,
     nav: &adw::NavigationView,
     now_playing: &Rc<NowPlaying>,
 ) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
 
+    let on_login = popup.on_login.clone();
     let nav = nav.downgrade();
     let now_playing = Rc::downgrade(now_playing);
-    keys.connect_key_pressed(move |controller, key, _, modifiers| {
+    keys.connect_key_pressed(move |_, key, _, modifiers| {
         let (Some(nav), Some(now_playing)) = (nav.upgrade(), now_playing.upgrade()) else {
             return glib::Propagation::Proceed;
         };
 
-        // Only handle keys when nav is actually the window content.
-        // If login page (or other) replaces it, let keypress reach the Entry widgets.
-        if let Some(window) = controller.widget().and_downcast::<adw::ApplicationWindow>() {
-            if let Some(content) = window.child() {
-                if !content.is::<gtk::Overlay>() {
-                    return glib::Propagation::Proceed;
-                }
-            }
+        // Only handle keys when we're on the now-playing page.
+        // Skip if login page is shown.
+        if on_login.get() {
+            return glib::Propagation::Proceed;
         }
 
         let on_root = nav
@@ -482,7 +480,7 @@ fn wire_shortcuts(
         now_playing.handle_key(key, modifiers)
     });
 
-    window.add_controller(keys);
+    popup.window.add_controller(keys);
 }
 
 /// Builds the root navigation page and returns it with the view that needs
@@ -1522,29 +1520,35 @@ fn spawn_event_loop(
                     toaster.show(message);
                 }
                 // The stored token was rejected, so the session is dead until
-                // the user signs in again. The sign-in form replaces the whole
-                // content (kept prefilled from the stored login), which also
-                // replaces the Toaster - so the "relogin" message lives on the
-                // form rather than in a toast that would be swapped away with
-                // the overlay it is drawn on. Its success path hot-starts,
-                // exactly like the startup form's.
+                // the user signs in again. Try to hot-start from the stored
+                // credentials first (a sign-in elsewhere may have refreshed
+                // them), and fall back to the login form if that fails.
                 Event::SessionExpired => {
                     // The load this reports (if it was one) is over, and a
                     // pending seek can never confirm either.
                     now_playing.clear_loading();
                     now_playing.cancel_pending_seek();
-                    tracing::warn!("credentials rejected by server, showing sign-in form");
-                    if !popup.on_login.replace(true) {
-                        let form_popup = popup.clone();
-                        let form_rt = rt.clone();
-                        let on_signed_in: login::OnSignedIn =
-                            Rc::new(move || form_popup.hot_start(&form_rt));
-                        popup.window.set_content(Some(&login::page(
-                            &popup.cfg,
-                            &rt,
-                            Some("Signed out by the server. Sign in again."),
-                            Some(on_signed_in),
-                        )));
+
+                    // `hot_start` shuts the dead session down and rebuilds
+                    // from the credentials on disk. It propagates build
+                    // errors (no cache dir, no audio device, rejected token)
+                    // instead of panicking, and here any failure becomes the
+                    // login form with the reason inline.
+                    if let Err(err) = popup.hot_start(&rt) {
+                        // Repeated expiry events must not stack another form
+                        // on top of one that is already up.
+                        if !popup.on_login.replace(true) {
+                            let form_popup = popup.clone();
+                            let form_rt = rt.clone();
+                            let on_signed_in: login::OnSignedIn =
+                                Rc::new(move || form_popup.hot_start(&form_rt));
+                            popup.window.set_content(Some(&login::page(
+                                &popup.cfg,
+                                &rt,
+                                Some(err.as_str()),
+                                Some(on_signed_in),
+                            )));
+                        }
                     }
                 }
             }

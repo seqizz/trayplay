@@ -171,7 +171,7 @@ impl Client {
             if let Ok(body) = resp.text().await {
                 tracing::debug!("login 401 body: {}", body);
             }
-            bail!("authentication rejected: wrong username or password");
+            bail!("wrong username or password");
         }
         let resp = resp.error_for_status().context("login failed")?;
 

@@ -12,6 +12,7 @@ mod tray;
 mod ui;
 
 use std::cell::RefCell;
+use std::time::Duration;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -160,8 +161,12 @@ fn start_player(
     // Verify the loaded credentials actually work before starting the player.
     // If the server rejects the token (expired, revoked, or rate-limited),
     // bail out so the UI can show the login form instead of failing at playback.
-    rt.block_on(client.validate())
-        .context("session token invalid, please sign in again")?;
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), client.validate())
+            .await
+    })
+        .context("session validation timed out, check server connection")
+        .and_then(|r| r.context("session token invalid, please sign in again"))?;
 
     let token = client.creds_clone().map(|c| c.token).unwrap_or_default();
     let cache = Arc::new(player::cache::Cache::new(
