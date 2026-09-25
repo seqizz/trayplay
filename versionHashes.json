@@ -1,0 +1,11 @@
+{
+  "0.3.2": {
+    "x86_64-linux": "sha256-VaSdBkOzpI6L8N791sO8/oRuK8OPYLcYCD04gD2xYI0="
+  },
+  "0.4.0": {
+    "x86_64-linux": "sha256-Dl8j89d3+MIaBIJJ4gTxE9PgUSr186S0aAqzaTuMJyY="
+  },
+  "0.6.0": {
+    "x86_64-linux": "sha256-9xizsBNry+fQHetsRZbmqPVMBIRWQbHhix6nHQZO/fg="
+  }
+}

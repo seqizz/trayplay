@@ -144,53 +144,55 @@
                 -czf $out -C ${trayplay} .
             '';
 
-        # `nix run .#bump -- patch|minor|major|X.Y.Z`
+        # `nix run .#bump -- [minor|X.Y.Z]` - the whole release in one command.
         #
         # `Cargo.toml`'s version is the single source of truth for the tag, the
         # artifact name, the prebuilt URL and `trayplay --version`, and the lock
-        # file records it a second time - so bumping by hand is two edits that
-        # have to agree, plus a commit and a tag named after them. This does that
-        # one way every time.
+        # file records it a second time. Bumping by hand used to be two edits
+        # that have to agree, plus a build, a hash paste, a commit and a tag;
+        # this does all of it, one way every time, in this order:
         #
-        # It stops at the files by default: committing and tagging are opt-in
-        # (`--commit`, `--tag`), because a bump is also how one tries a version
-        # number out. Nothing here pushes, and nothing here touches
-        # `prebuiltHashes` - that hash cannot exist until the artifact does.
+        #   1. bump the version in Cargo.toml (Cargo.lock follows via cargo)
+        #   2. build `releaseTarball` and hash it
+        #   3. record the hash in versionHashes.json, where `.#prebuilt` reads it
+        #   4. `git add .`, commit "Version X.Y.Z", tag vX.Y.Z
+        #   5. `git ptb` (the operator's push alias), then push the tag
+        #
+        # The commit takes the whole tree on purpose: this is the operator's
+        # one-command flow and whatever is in the tree goes out with the
+        # release. The tarball for the forge is built by the release workflow
+        # from the same derivation, and a Nix build is deterministic, so the
+        # recorded hash matches what the workflow uploads.
         bump = pkgs.writeShellApplication {
           name = "trayplay-bump";
           # cargo is what rewrites Cargo.lock; letting it do that is safer than
-          # sed on a file whose format is cargo's business.
+          # sed on a file whose format is cargo's business. jq writes the hash
+          # file for the same reason: JSON is data to it, where Nix syntax
+          # would be string surgery.
           runtimeInputs = [
             pkgs.git
+            pkgs.jq
             toolchain
           ];
           text = ''
             usage() {
               cat >&2 <<'EOF'
-            usage: trayplay-bump [patch|minor|major|X.Y.Z] [--commit] [--tag]
+            usage: trayplay-bump [minor|X.Y.Z]
 
-              patch (default)  0.2.1 -> 0.2.2
-              minor            0.2.1 -> 0.3.0
-              major            0.2.1 -> 1.0.0
+              minor (default)  0.2.1 -> 0.3.0
               X.Y.Z            set it outright
 
-              --commit   commit Cargo.toml and Cargo.lock, and nothing else
-              --tag      also create the annotated tag vX.Y.Z (implies --commit)
+            Builds the release tarball, records its hash in versionHashes.json,
+            commits the whole tree as "Version X.Y.Z", tags it, and pushes.
             EOF
               exit 2
             }
 
-            # Quoted: bare `patch` is also a command, which shellcheck objects to.
-            what="patch"
-            commit=0
-            tag=0
+            # Quoted: bare `minor` is also a command, which shellcheck objects to.
+            what="minor"
             for arg in "$@"; do
               case "$arg" in
-                patch|minor|major) what="$arg" ;;
-                --commit) commit=1 ;;
-                # A tag has to point at the commit that carries the version, so
-                # there is no useful meaning for --tag on its own.
-                --tag) tag=1; commit=1 ;;
+                minor) what="$arg" ;;
                 -h|--help) usage ;;
                 *.*.*) what="$arg" ;;
                 *) echo "unrecognised argument: $arg" >&2; usage ;;
@@ -209,20 +211,15 @@
             fi
 
             case "$what" in
-              patch|minor|major)
-                IFS=. read -r major minor patch <<<"$current"
-                case "$major$minor$patch" in
-                  *[!0-9]*|"")
-                    echo "current version $current is not X.Y.Z; pass one explicitly" >&2
-                    exit 1
-                    ;;
-                esac
-                case "$what" in
-                  patch) patch=$((patch + 1)) ;;
-                  minor) minor=$((minor + 1)); patch=0 ;;
-                  major) major=$((major + 1)); minor=0; patch=0 ;;
-                esac
-                next="$major.$minor.$patch"
+              minor)
+                if ! [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  echo "current version $current is not X.Y.Z; pass one explicitly" >&2
+                  exit 1
+                fi
+                # awk rather than braced shell expansion: this script lives in
+                # a Nix indented string, where a dollar-brace starts an
+                # interpolation, so braced shell expansions are not an option.
+                next=$(printf '%s\n' "$current" | awk -F. '{ print $1 "." $2 + 1 ".0" }')
                 ;;
               *)
                 next="$what"
@@ -240,15 +237,7 @@
               exit 1
             fi
 
-            # Path-limited, because the working tree is usually mid-change and
-            # the commit below is deliberately only these two files. Edits
-            # already sitting in them would be swept into it.
-            if [ "$commit" = 1 ] && ! git diff --quiet HEAD -- Cargo.toml Cargo.lock; then
-              echo "Cargo.toml or Cargo.lock already has uncommitted changes;" >&2
-              echo "commit or stash them first, or bump without --commit." >&2
-              exit 1
-            fi
-            if [ "$tag" = 1 ] && git rev-parse -q --verify "refs/tags/v$next" >/dev/null; then
+            if git rev-parse -q --verify "refs/tags/v$next" >/dev/null; then
               echo "tag v$next already exists" >&2
               exit 1
             fi
@@ -275,22 +264,40 @@
 
             echo "$current -> $next"
 
-            if [ "$commit" = 1 ]; then
-              git commit --quiet -m "Version $next" -- Cargo.toml Cargo.lock
-              echo "committed"
-            fi
-            if [ "$tag" = 1 ]; then
-              git tag -a "v$next" -m "trayplay $next"
-              echo "tagged v$next"
-            fi
+            # Built here so the hash is known before anything is pushed. The
+            # release workflow attaches this same derivation, and a Nix build
+            # is deterministic, so its hash is this hash.
+            nix build .#releaseTarball
+            hash=$(nix hash file --type sha256 --sri result)
+            system=$(nix eval --impure --raw --expr builtins.currentSystem)
+
+            # jq, not sed on flake.nix: the hash is data and versionHashes.json
+            # is where Nix reads it from. Written under the new version, which
+            # `.#prebuilt` looks up through Cargo.toml's version.
+            [ -f versionHashes.json ] || echo '{}' > versionHashes.json
+            jq --arg v "$next" --arg s "$system" --arg h "$hash" \
+              '.[$v][$s] = $h' versionHashes.json > versionHashes.json.tmp
+            mv versionHashes.json.tmp versionHashes.json
+
+            # Whole tree, per the note above this derivation. Also what makes
+            # versionHashes.json tracked on its first release - a flake cannot
+            # see untracked files, so the hash file must be in git before any
+            # later eval reads it.
+            git add .
+            git commit --quiet -m "Version $next"
+            git tag -a "v$next" -m "trayplay $next"
+            echo "committed and tagged v$next"
+
+            # `git ptb` is the operator's git alias for pushing the branch. The
+            # tag is pushed separately so nothing depends on the alias's flags.
+            git ptb
+            git push origin "v$next"
 
             cat <<EOF
 
-            Next, for a release:
-              git push && git push origin v$next   # if you tagged
-              nix build .#releaseTarball           # what the workflow builds
-              nix hash file --type sha256 --sri result
-            then paste the hash into prebuiltHashes in flake.nix under "$next".
+            Pushed $next. The release workflow attaches the tarball to the
+            tag's release; until it does, nix build .#prebuilt has the hash
+            but nothing to fetch.
             EOF
           '';
         };
@@ -312,20 +319,13 @@
         # the honest outcome: `.#prebuilt` fails with the message below instead
         # of fetching a tarball nobody has verified.
         #
-        # Inline rather than a separate pin file on purpose: a new file has to be
-        # `git add`ed before a flake can even see it (Nix copies tracked files
-        # only), which is a confusing failure for something that looks like data.
-        # The release workflow prints a ready-made entry in the release notes, so
-        # updating it is a copy-paste and a commit. Old entries can stay - they
-        # cost nothing and document what was released.
-        prebuiltHashes = {
-          "0.3.2" = {
-            x86_64-linux = "sha256-VaSdBkOzpI6L8N791sO8/oRuK8OPYLcYCD04gD2xYI0=";
-          };
-          "0.4.0" = {
-            x86_64-linux = "sha256-Dl8j89d3+MIaBIJJ4gTxE9PgUSr186S0aAqzaTuMJyY=";
-          };
-        };
+        # In versionHashes.json rather than inline: `nix run .#bump` writes the
+        # new entry itself, and JSON is data to a tool where Nix syntax would be
+        # string surgery. Read at eval time, so the file has to be tracked by
+        # git (Nix copies tracked files only) - `bump` runs `git add .` before
+        # every push, which is what keeps that true. Old entries can stay -
+        # they cost nothing and document what was released.
+        prebuiltHashes = builtins.fromJSON (builtins.readFile ./versionHashes.json);
 
         # Installs the binary from a Forgejo release instead of building it.
         #
@@ -347,7 +347,7 @@
           if pinnedHash == "" then
             pkgs.runCommand "trayplay-bin-unavailable" { } ''
               echo "No prebuilt trayplay ${version} for ${system}: no hash for that" >&2
-              echo "version in flake.nix's prebuiltHashes - either it has not been" >&2
+              echo "version in versionHashes.json - either it has not been" >&2
               echo "released yet, or the entry is missing. Build from source" >&2
               echo "instead:  nix build .#trayplay" >&2
               exit 1
@@ -406,7 +406,7 @@
 
         apps = {
           default = flake-utils.lib.mkApp { drv = trayplay; };
-          # `nix run .#bump -- minor --tag`. exePath spelled out because the
+          # `nix run .#bump`. exePath spelled out because the
           # derivation name is not the flake attribute name.
           bump = flake-utils.lib.mkApp {
             drv = bump;
